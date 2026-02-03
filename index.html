@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sky Fury - 3D Plane Combat</title>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@700;900&family=Rajdhani:wght@500;600&display=swap');
+        
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        
+        body {
+            overflow: hidden;
+            background: #0a0a12;
+            font-family: 'Rajdhani', sans-serif;
+        }
+        
+        #game-container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+        
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        
+        #hud {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            padding: 20px;
+            color: #00ffcc;
+            text-shadow: 0 0 10px rgba(0, 255, 204, 0.5);
+            pointer-events: none;
+            z-index: 10;
+        }
+        
+        #hud h1 {
+            font-family: 'Orbitron', monospace;
+            font-size: 1.8rem;
+            font-weight: 900;
+            letter-spacing: 4px;
+            margin-bottom: 8px;
+        }
+        
+        #hud .stats {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+        
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            color: rgba(0, 255, 204, 0.8);
+            font-size: 0.9rem;
+            line-height: 1.6;
+            pointer-events: none;
+        }
+        
+        #game-over-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(80, 0, 0, 0.75);
+            display: none;
+            z-index: 99;
+            pointer-events: none;
+        }
+        
+        #game-over {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            display: none;
+            z-index: 100;
+            pointer-events: auto;
+        }
+        
+        #game-over h2 {
+            font-family: 'Impact', 'Arial Black', sans-serif;
+            font-size: 6rem;
+            font-weight: 900;
+            color: white;
+            text-transform: uppercase;
+            letter-spacing: 0.1em;
+            margin-bottom: 8px;
+            text-shadow: 
+                4px 4px 0 #000,
+                -2px -2px 0 #000,
+                2px -2px 0 #000,
+                -2px 2px 0 #000,
+                0 0 20px rgba(0, 0, 0, 0.8);
+            animation: wastedZoom 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+            transform-origin: center;
+        }
+        
+        #game-over p {
+            font-size: 1.1rem;
+            color: rgba(255, 255, 255, 0.9);
+            margin-bottom: 24px;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            animation: wastedFade 0.5s ease-out 0.2s both;
+        }
+        
+        #restart-btn {
+            padding: 14px 36px;
+            font-size: 0.95rem;
+            font-family: 'Impact', 'Arial Black', sans-serif;
+            font-weight: 900;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            background: white;
+            color: #8b0000;
+            border: none;
+            cursor: pointer;
+            transition: all 0.15s;
+            pointer-events: auto;
+            animation: wastedFade 0.5s ease-out 0.4s both;
+        }
+        
+        #restart-btn:hover {
+            background: #ff4444;
+            color: white;
+            transform: scale(1.02);
+        }
+        
+        @keyframes wastedZoom {
+            0% { transform: scale(0.3); opacity: 0; }
+            100% { transform: scale(1); opacity: 1; }
+        }
+        
+        @keyframes wastedFade {
+            0% { opacity: 0; }
+            100% { opacity: 1; }
+        }
+        
+        #lock-bracket {
+            position: fixed;
+            display: none;
+            pointer-events: none;
+            z-index: 20;
+            border: 3px solid #ff4444;
+            box-shadow: 0 0 10px rgba(255, 68, 68, 0.9);
+            box-sizing: border-box;
+        }
+        
+        #minimap {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            width: 160px;
+            height: 160px;
+            border-radius: 50%;
+            border: 3px solid rgba(0, 255, 204, 0.6);
+            box-shadow: 0 0 15px rgba(0, 255, 204, 0.3), inset 0 0 20px rgba(0, 0, 0, 0.5);
+            overflow: hidden;
+            background: rgba(10, 20, 30, 0.85);
+            pointer-events: none;
+            z-index: 15;
+        }
+        
+        #minimap canvas {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+        
+        #screen-brighten {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(ellipse 120% 120% at 50% 50%, rgba(255, 255, 255, 0.95) 0%, rgba(255, 240, 200, 0.4) 50%, rgba(255, 255, 255, 0) 100%);
+            pointer-events: none;
+            z-index: 50;
+            opacity: 0;
+        }
+    </style>
+</head>
+<body>
+    <div id="game-container">
+        <div id="hud">
+            <h1>SKY FURY</h1>
+            <div class="stats">Altitude: <span id="altitude">0</span>m | Speed: <span id="speed">0</span> | Status: <span id="status">FLYING</span> | Kills: <span id="kills">0</span> | Cannons: <span id="cannons-remaining">0</span> | <span id="lock-status" style="color:#ff4444"></span></div>
+        </div>
+        
+        <div id="controls">
+            W/S - Throttle | A/D - Roll | Numpad 8/5 - Pitch | Numpad 4/6 - Roll | SPACE - Fire | C - Look behind | Mouse - Camera
+        </div>
+        
+        <div id="lock-bracket"></div>
+        
+        <div id="screen-brighten"></div>
+        
+        <div id="minimap">
+            <canvas id="minimap-canvas" width="160" height="160"></canvas>
+        </div>
+        
+        <div id="game-over-overlay"></div>
+        <div id="game-over">
+            <h2 id="game-over-title">WASTED</h2>
+            <p id="game-over-subtitle">You hit the terrain at full speed</p>
+            <button id="restart-btn">Restart</button>
+        </div>
+    </div>
+
+    <script type="importmap" crossorigin="anonymous">
+    {
+        "imports": {
+            "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script type="module" src="game.js"></script>
+</body>
+</html>
