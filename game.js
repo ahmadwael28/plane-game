@@ -1,18 +1,14 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-// ============ GAME STATE ============
-// Terrain config - must be before planeState (which uses TERRAIN_SIZE)
-const TERRAIN_SIZE = 4000;  // 2x bigger - 8x was too heavy for performance
-const TERRAIN_SEGMENTS = 128;
+import { TERRAIN_SIZE, TERRAIN_SEGMENTS, SUN_POSITION, LIGHT_POSITION, MISSILE_RELOAD_TIME, PLANE_MODEL_URL } from './js/config.js';
+import { noise2D, createTerrainTexture, createSmokeTexture, createCloudTexture } from './js/utils.js';
 
+// ============ GAME STATE ============
 let scene, camera, renderer;
 let plane, planeGroup;
 let terrain, terrainGeometry;
-let water = null;  // Water mesh for ripple animation
-let sunMesh = null;  // Visible sun disc in sky
-const SUN_POSITION = new THREE.Vector3(400, 800, 200);  // World position of sun
-const LIGHT_POSITION = new THREE.Vector3(-800, 120, -600);  // Secondary light (e.g. distant)
+let water = null;
 let trees = [];  // Tree instances for collision
 let cannons = [];  // Ground cannons - fire homing missiles
 let initialCannonCount = 0;  // For kills/remaining display
@@ -26,7 +22,6 @@ let flaps = [];  // Flap meshes for animation
 let wingMissileLeft = null;  // Stored missile under left wing
 let wingMissileRight = null;  // Stored missile under right wing
 const wingMissileReload = { left: 0, right: 0 };
-const MISSILE_RELOAD_TIME = 3;
 let gameOver = false;
 let crashed = false;
 let hitByMissile = false;  // Set when enemy missile hits; game continues until terrain crash
@@ -68,9 +63,6 @@ const cameraOrbit = {
     autoCenterSpeed: 2.5,   // how fast camera returns to center when mouse idle
     idleTimeToCenter: 1.5,  // seconds of no mouse movement before auto-center
 };
-
-// Optional: Set to a URL to load a custom plane GLB model (e.g. from Sketchfab download)
-const PLANE_MODEL_URL = null;  // e.g. 'models/plane.glb'
 
 // ============ AUDIO (Web Audio API - procedural sounds, no external files) ============
 let audioCtx = null;
@@ -262,11 +254,11 @@ function startMissilePropellingSound(pos) {
 
 // Create smoke/cloud particle trail for a missile
 function createMissileTrail(color) {
+    const smokeTexture = createSmokeTexture();
     const maxParticles = 120;
     const geometry = new THREE.BufferGeometry();
     const positions = new Float32Array(maxParticles * 3);
     geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-    const smokeTexture = createSmokeTexture();
     const material = new THREE.PointsMaterial({
         map: smokeTexture,
         transparent: true,
@@ -322,24 +314,6 @@ function createMissileTrail(color) {
             this.line.geometry.setDrawRange(0, alive);
         }
     };
-}
-
-function createSmokeTexture() {
-    const size = 64;
-    const canvas = document.createElement('canvas');
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext('2d');
-    const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
-    g.addColorStop(0, 'rgba(255, 255, 255, 0.9)');
-    g.addColorStop(0.3, 'rgba(255, 255, 255, 0.5)');
-    g.addColorStop(0.6, 'rgba(255, 255, 255, 0.15)');
-    g.addColorStop(1, 'rgba(255, 255, 255, 0)');
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, size, size);
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.needsUpdate = true;
-    return texture;
 }
 
 function playExplosion(pos, isBig = false) {
@@ -538,36 +512,7 @@ function createClouds() {
     }
 }
 
-function createCloudTexture() {
-    const size = 256;
-    const canvas = document.createElement('canvas');
-    canvas.width = size;
-    canvas.height = size;
-    const ctx = canvas.getContext('2d');
-    
-    const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
-    g.addColorStop(0, 'rgba(255, 255, 255, 0.9)');
-    g.addColorStop(0.4, 'rgba(248, 250, 255, 0.6)');
-    g.addColorStop(0.7, 'rgba(240, 248, 255, 0.2)');
-    g.addColorStop(1, 'rgba(255, 255, 255, 0)');
-    
-    ctx.fillStyle = g;
-    ctx.fillRect(0, 0, size, size);
-    
-    const texture = new THREE.CanvasTexture(canvas);
-    texture.needsUpdate = true;
-    return texture;
-}
-
-// ============ SIMPLEX NOISE (simplified) ============
-function noise2D(x, y) {
-    const n = Math.sin(x * 0.01) * Math.cos(y * 0.01) * 10 +
-              Math.sin(x * 0.02 + 1) * Math.cos(y * 0.02) * 5 +
-              Math.sin((x + y) * 0.005) * 8;
-    return n;
-}
-
-// ============ CREATE TERRAIN ============
+// ============ CREATE TERRAIN (uni GP blend-map) ============
 function createTerrain() {
     const geometry = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_SEGMENTS);
     geometry.rotateX(-Math.PI / 2);
@@ -587,12 +532,101 @@ function createTerrain() {
     
     geometry.computeVertexNormals();
     
-    const texture = new THREE.CanvasTexture(createTerrainTexture());
-    texture.wrapS = texture.wrapT = THREE.RepeatWrapping;
-    texture.repeat.set(20, 20);
+    const fallbackTexture = new THREE.CanvasTexture(createTerrainTexture());
+    fallbackTexture.wrapS = fallbackTexture.wrapT = THREE.RepeatWrapping;
+    fallbackTexture.repeat.set(20, 20);
+    
+    const loader = new THREE.TextureLoader();
+    loader.load('textures/grassy2.png', (bg) => {
+        loader.load('textures/mud.png', (r) => {
+            loader.load('textures/grassFlowers.png', (g) => {
+                    loader.load('textures/grassy2.png', (b) => {
+                    loader.load('textures/blendMap.png', (blend) => {
+                        [bg, r, g, b].forEach(t => { t.wrapS = t.wrapT = THREE.RepeatWrapping; });
+                        blend.wrapS = blend.wrapT = THREE.ClampToEdgeWrapping;
+                        
+                        const mat = new THREE.ShaderMaterial({
+                            uniforms: {
+                                backgroundTexture: { value: bg },
+                                rTexture: { value: r },
+                                gTexture: { value: g },
+                                bTexture: { value: b },
+                                blendMap: { value: blend },
+                                sunDir: { value: SUN_POSITION.clone().normalize() },
+                                sunColor: { value: new THREE.Color(0xfff5e6) },
+                                skyColour: { value: (scene.fog && scene.fog.color) ? scene.fog.color.clone() : new THREE.Color(0x87ceeb) },
+                                density: { value: 0.0009 },
+                                gradient: { value: 1.0 },
+                            },
+                            vertexShader: `
+                                varying vec2 vUv;
+                                varying vec3 vNormal;
+                                varying vec3 vSunDir;
+                                varying float vVisibility;
+                                uniform vec3 sunDir;
+                                uniform float density;
+                                uniform float gradient;
+                                void main() {
+                                    vUv = uv;
+                                    vNormal = normalize(normalMatrix * normal);
+                                    vSunDir = (viewMatrix * vec4(sunDir, 0.0)).xyz;
+                                    vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
+                                    float dist = length(mvPos.xyz);
+                                    vVisibility = clamp(exp(-pow((dist * density), gradient)), 0.0, 1.0);
+                                    gl_Position = projectionMatrix * mvPos;
+                                }
+                            `,
+                            fragmentShader: `
+                                uniform sampler2D backgroundTexture;
+                                uniform sampler2D rTexture;
+                                uniform sampler2D gTexture;
+                                uniform sampler2D bTexture;
+                                uniform sampler2D blendMap;
+                                uniform vec3 sunColor;
+                                uniform vec3 skyColour;
+                                varying vec2 vUv;
+                                varying vec3 vNormal;
+                                varying vec3 vSunDir;
+                                varying float vVisibility;
+                                void main() {
+                                    vec4 blendMapColour = texture2D(blendMap, vUv);
+                                    float backAmount = 1.0 - (blendMapColour.r + blendMapColour.g + blendMapColour.b);
+                                    vec2 tiled = vUv * 40.0;
+                                    vec4 bgCol = texture2D(backgroundTexture, tiled) * backAmount;
+                                    vec4 rCol = texture2D(rTexture, tiled) * blendMapColour.r;
+                                    vec4 gCol = texture2D(gTexture, tiled) * blendMapColour.g;
+                                    vec4 bCol = texture2D(bTexture, tiled) * blendMapColour.b;
+                                    vec4 totalColour = bgCol + rCol + gCol + bCol;
+                                    vec3 N = normalize(vNormal);
+                                    vec3 L = normalize(vSunDir);
+                                    float NdotL = max(dot(N, L), 0.3);
+                                    vec3 diffuse = NdotL * sunColor.rgb;
+                                    diffuse = max(diffuse, vec3(0.2));
+                                    vec4 lit = vec4(diffuse, 1.0) * totalColour;
+                                    gl_FragColor = mix(vec4(skyColour, 1.0), lit, vVisibility);
+                                }
+                            `,
+                            lights: false,
+                            depthWrite: true,
+                            depthTest: true,
+                        });
+                        
+                        try {
+                            if (terrain) {
+                                terrain.material.dispose();
+                                terrain.material = mat;
+                            }
+                        } catch (e) {
+                            console.warn('Terrain shader failed:', e);
+                        }
+                    });
+                });
+            });
+        });
+    });
     
     const material = new THREE.MeshStandardMaterial({
-        map: texture,
+        map: fallbackTexture,
         roughness: 0.9,
         metalness: 0.1,
         flatShading: false,
@@ -1038,27 +1072,6 @@ function createCannons() {
         placed++;
     }
     initialCannonCount = cannons.length;
-}
-
-function createTerrainTexture() {
-    const canvas = document.createElement('canvas');
-    canvas.width = 256;
-    canvas.height = 256;
-    const ctx = canvas.getContext('2d');
-    
-    const gradient = ctx.createLinearGradient(0, 0, 0, 256);
-    gradient.addColorStop(0, '#2d5016');
-    gradient.addColorStop(0.5, '#3d6b1f');
-    gradient.addColorStop(1, '#1a3010');
-    ctx.fillStyle = gradient;
-    ctx.fillRect(0, 0, 256, 256);
-    
-    for (let i = 0; i < 500; i++) {
-        ctx.fillStyle = `rgba(60, 90, 30, ${Math.random() * 0.3})`;
-        ctx.fillRect(Math.random() * 256, Math.random() * 256, 2, 2);
-    }
-    
-    return canvas;
 }
 
 // ============ GET TERRAIN HEIGHT AT POSITION ============
@@ -1640,18 +1653,6 @@ function init() {
     sun.shadow.camera.bottom = -200;
     scene.add(sun);
     
-    // Visible sun disc in sky
-    const sunGeom = new THREE.SphereGeometry(120, 16, 16);
-    const sunMat = new THREE.MeshBasicMaterial({
-        color: 0xfff5e0,
-        transparent: true,
-        opacity: 0.95,
-    });
-    sunMesh = new THREE.Mesh(sunGeom, sunMat);
-    sunMesh.position.copy(SUN_POSITION);
-    sunMesh.frustumCulled = false;
-    sunMesh.renderOrder = 5;
-    scene.add(sunMesh);
     
     // Secondary point light - creates distinct reflection on water
     const pointLight = new THREE.PointLight(0xffeedd, 0.8, 1200);
