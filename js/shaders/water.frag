@@ -8,6 +8,9 @@ uniform float uWaterSize;
 uniform float uMoveFactor;
 uniform sampler2D uDudvMap;
 uniform sampler2D uNormalMap;
+uniform sampler2D uTerrainHeightMap;
+uniform float uTerrainSize;
+uniform float uWaterLevel;
 uniform vec3 fogColor;
 uniform float fogNear;
 uniform float fogFar;
@@ -113,8 +116,16 @@ void main() {
     vec3 reflectColor = mix(deepColor, envReflection, fresnel * 0.95);
     
     vec3 finalColor = reflectColor;
-    finalColor = mix(finalColor, vec3(0.0, 0.3, 0.5), 0.2);
+    finalColor = mix(finalColor, vec3(0.2, 0.5, 0.65), 0.08);
     float alpha = mix(0.45, 0.72, fresnel);
+    
+    vec2 terrainUV = (vWorldPosition.xz + uTerrainSize) / uTerrainSize;
+    float shoreFade = 0.0;
+    if (terrainUV.x >= 0.0 && terrainUV.x <= 1.0 && terrainUV.y >= 0.0 && terrainUV.y <= 1.0) {
+        float terrainHeight = texture2D(uTerrainHeightMap, terrainUV).r * 160.0 - 80.0;
+        shoreFade = smoothstep(-15.0, -5.0, terrainHeight);
+    }
+    alpha *= 1.0 - shoreFade * 0.75;
     
     vec4 baseColor = vec4(finalColor, alpha);
     float fogFactor = clamp((fogFar - vFogDepth) / (fogFar - fogNear), 0.0, 1.0);

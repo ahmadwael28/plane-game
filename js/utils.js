@@ -9,7 +9,8 @@ export async function loadShaders() {
             fetch(`js/shaders/${name}.vert`).then(r => r.text()),
             fetch(`js/shaders/${name}.frag`).then(r => r.text()),
         ]);
-        results[name] = { vertexShader: vert, fragmentShader: frag };
+        const stripBOM = (s) => s.replace(/^\uFEFF/, '').trim();
+        results[name] = { vertexShader: stripBOM(vert), fragmentShader: stripBOM(frag) };
     }));
     return results;
 }
@@ -18,6 +19,47 @@ export function noise2D(x, y) {
     return Math.sin(x * 0.01) * Math.cos(y * 0.01) * 10 +
            Math.sin(x * 0.02 + 1) * Math.cos(y * 0.02) * 5 +
            Math.sin((x + y) * 0.005) * 8;
+}
+
+const smoothstep = (e0, e1, x) => {
+    const t = Math.max(0, Math.min(1, (x - e0) / (e1 - e0)));
+    return t * t * (3 - 2 * t);
+};
+
+/** Terrain height at (x,z) in terrain coords 0..terrainSize*2, with edge falloff so edges are under water. */
+export function terrainHeightAt(x, z, terrainSize) {
+    const center = terrainSize / 2;
+    const innerRadius = 600;
+    const outerRadius = 2000;
+    const edgeDrop = 55;
+    const baseHeight = noise2D(x, z) + noise2D(x * 2, z * 2) * 0.5 +
+        Math.abs(Math.sin(x * 0.005) * Math.cos(z * 0.005)) * 15;
+    const distFromCenter = Math.sqrt((x - center) ** 2 + (z - center) ** 2);
+    const falloff = smoothstep(innerRadius, outerRadius, distFromCenter);
+    return baseHeight * 3 - falloff * edgeDrop;
+}
+
+/** Creates a terrain height texture for shoreline blending. Height in R (0-1 = -80..80). Terrain world XZ: -terrainSize to 0. */
+export function createTerrainHeightTexture(terrainSize) {
+    const res = 512;
+    const data = new Uint8Array(res * res);
+    for (let j = 0; j < res; j++) {
+        for (let i = 0; i < res; i++) {
+            const worldX = (i / (res - 1)) * terrainSize - terrainSize;
+            const worldZ = (j / (res - 1)) * terrainSize - terrainSize;
+            const x = worldX + terrainSize;
+            const z = worldZ + terrainSize;
+            const terrainHeight = terrainHeightAt(x, z, terrainSize);
+            const norm = (terrainHeight + 80) / 160;
+            data[j * res + i] = Math.floor(Math.max(0, Math.min(1, norm)) * 255);
+        }
+    }
+    const tex = new THREE.DataTexture(data, res, res, THREE.RedFormat);
+    tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+    tex.minFilter = THREE.LinearFilter;
+    tex.magFilter = THREE.LinearFilter;
+    tex.needsUpdate = true;
+    return tex;
 }
 
 export function createTerrainTexture() {

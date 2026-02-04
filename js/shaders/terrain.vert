@@ -2,8 +2,8 @@ varying vec2 vUv;
 varying vec3 vNormal;
 varying vec3 vLightDir;
 varying float vVisibility;
+
 uniform vec3 lightPosition;
-uniform mat4 modelMatrix;
 uniform float density;
 uniform float gradient;
 

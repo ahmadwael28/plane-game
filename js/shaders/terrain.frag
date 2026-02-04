@@ -1,3 +1,5 @@
+precision mediump float;
+
 uniform sampler2D backgroundTexture;
 uniform sampler2D rTexture;
 uniform sampler2D gTexture;
@@ -12,7 +14,7 @@ varying float vVisibility;
 
 void main() {
     vec4 blendMapColour = texture2D(blendMap, vUv);
-    float backAmount = 1.0 - (blendMapColour.r + blendMapColour.g + blendMapColour.b);
+    float backAmount = max(0.0, 1.0 - (blendMapColour.r + blendMapColour.g + blendMapColour.b));
     vec2 tiled = vUv * 40.0;
     vec4 bgCol = texture2D(backgroundTexture, tiled) * backAmount;
     vec4 rCol = texture2D(rTexture, tiled) * blendMapColour.r;

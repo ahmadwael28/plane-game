@@ -2,7 +2,7 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 import { TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_LIGHT_POSITION, MISSILE_RELOAD_TIME, PLANE_MODEL_URL } from './js/config.js';
-import { loadShaders, noise2D, createTerrainTexture, createSmokeTexture, createCloudTexture } from './js/utils.js';
+import { loadShaders, noise2D, terrainHeightAt, createTerrainTexture, createTerrainHeightTexture, createSmokeTexture, createCloudTexture } from './js/utils.js';
 
 // ============ GAME STATE ============
 let scene, camera, renderer;
@@ -415,9 +415,9 @@ function createSkybox(shaders) {
     const geometry = new THREE.BoxGeometry(skyboxSize, skyboxSize, skyboxSize);
     const skyboxMaterial = new THREE.ShaderMaterial({
         uniforms: {
-            uZenithColor: { value: new THREE.Color(0x1a3a5c) },
-            uHorizonColor: { value: new THREE.Color(0x87ceeb) },
-            uGroundColor: { value: new THREE.Color(0xb0c4de) },
+            uZenithColor: { value: new THREE.Color(0x5a8ab8) },
+            uHorizonColor: { value: new THREE.Color(0xa8d8f8) },
+            uGroundColor: { value: new THREE.Color(0xc8dcf0) },
         },
         vertexShader: shaders.vertexShader,
         fragmentShader: shaders.fragmentShader,
@@ -463,7 +463,7 @@ function createClouds() {
     }
 }
 
-// ============ CREATE TERRAIN (uni GP blend-map) ============
+// ============ CREATE TERRAIN (blend-map) ============
 function createTerrain(shaders) {
     const geometry = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_SEGMENTS);
     geometry.rotateX(-Math.PI / 2);
@@ -475,10 +475,7 @@ function createTerrain(shaders) {
     for (let i = 0; i < positions.count; i++) {
         const x = positions.getX(i) + centerX;
         const z = positions.getZ(i) + centerZ;
-        const height = noise2D(x, z) + 
-                       noise2D(x * 2, z * 2) * 0.5 +
-                       Math.abs(Math.sin(x * 0.005) * Math.cos(z * 0.005)) * 15;
-        positions.setY(i, height * 3);
+        positions.setY(i, terrainHeightAt(x, z, TERRAIN_SIZE));
     }
     
     geometry.computeVertexNormals();
@@ -487,60 +484,67 @@ function createTerrain(shaders) {
     fallbackTexture.wrapS = fallbackTexture.wrapT = THREE.RepeatWrapping;
     fallbackTexture.repeat.set(20, 20);
     
+    const blendPlaceholder = new THREE.DataTexture(new Uint8Array([64, 64, 64, 255]), 1, 1);
+    blendPlaceholder.format = THREE.RGBAFormat;
+    blendPlaceholder.wrapS = blendPlaceholder.wrapT = THREE.ClampToEdgeWrapping;
+    blendPlaceholder.needsUpdate = true;
+    
+    let terrainMat;
+    try {
+        terrainMat = new THREE.ShaderMaterial({
+            uniforms: {
+                backgroundTexture: { value: fallbackTexture },
+                rTexture: { value: fallbackTexture },
+                gTexture: { value: fallbackTexture },
+                bTexture: { value: fallbackTexture },
+                blendMap: { value: blendPlaceholder },
+                lightPosition: { value: TERRAIN_LIGHT_POSITION.clone() },
+                lightColor: { value: new THREE.Color(0xf5faff) },
+                skyColour: { value: (scene.fog && scene.fog.color) ? scene.fog.color.clone() : new THREE.Color(0xb8dce8) },
+                density: { value: 0.0004 },
+                gradient: { value: 1.0 },
+            },
+            vertexShader: shaders.terrain.vertexShader,
+            fragmentShader: shaders.terrain.fragmentShader,
+            lights: false,
+            depthWrite: true,
+            depthTest: true,
+        });
+    } catch (e) {
+        console.warn('Terrain shader failed, using fallback:', e);
+        terrainMat = new THREE.MeshStandardMaterial({
+            map: fallbackTexture,
+            roughness: 0.9,
+            metalness: 0.1,
+            flatShading: false,
+        });
+    }
+    
+    terrain = new THREE.Mesh(geometry, terrainMat);
+    terrain.position.set(-TERRAIN_SIZE / 2, 0, -TERRAIN_SIZE / 2);
+    terrain.receiveShadow = true;
+    scene.add(terrain);
+    
     const loader = new THREE.TextureLoader();
     loader.load('textures/grassy2.png', (bg) => {
         loader.load('textures/mud.png', (r) => {
             loader.load('textures/grassFlowers.png', (g) => {
-                    loader.load('textures/grassy2.png', (b) => {
+                loader.load('textures/grassy2.png', (b) => {
                     loader.load('textures/blendMap.png', (blend) => {
                         [bg, r, g, b].forEach(t => { t.wrapS = t.wrapT = THREE.RepeatWrapping; });
                         blend.wrapS = blend.wrapT = THREE.ClampToEdgeWrapping;
-                        
-                        const mat = new THREE.ShaderMaterial({
-                            uniforms: {
-                                backgroundTexture: { value: bg },
-                                rTexture: { value: r },
-                                gTexture: { value: g },
-                                bTexture: { value: b },
-                                blendMap: { value: blend },
-                                lightPosition: { value: TERRAIN_LIGHT_POSITION.clone() },
-                                lightColor: { value: new THREE.Color(0xe8f0f8) },
-                                skyColour: { value: (scene.fog && scene.fog.color) ? scene.fog.color.clone() : new THREE.Color(0x87ceeb) },
-                                density: { value: 0.0009 },
-                                gradient: { value: 1.0 },
-                            },
-                            vertexShader: shaders.terrain.vertexShader,
-                            fragmentShader: shaders.terrain.fragmentShader,
-                            lights: false,
-                            depthWrite: true,
-                            depthTest: true,
-                        });
-                        
-                        try {
-                            if (terrain) {
-                                terrain.material.dispose();
-                                terrain.material = mat;
-                            }
-                        } catch (e) {
-                            console.warn('Terrain shader failed:', e);
+                        if (terrain && terrain.material.uniforms) {
+                            terrain.material.uniforms.backgroundTexture.value = bg;
+                            terrain.material.uniforms.rTexture.value = r;
+                            terrain.material.uniforms.gTexture.value = g;
+                            terrain.material.uniforms.bTexture.value = b;
+                            terrain.material.uniforms.blendMap.value = blend;
                         }
                     });
                 });
             });
         });
     });
-    
-    const material = new THREE.MeshStandardMaterial({
-        map: fallbackTexture,
-        roughness: 0.9,
-        metalness: 0.1,
-        flatShading: false,
-    });
-    
-    terrain = new THREE.Mesh(geometry, material);
-    terrain.position.set(-TERRAIN_SIZE / 2, 0, -TERRAIN_SIZE / 2);
-    terrain.receiveShadow = true;
-    scene.add(terrain);
     
     terrainGeometry = geometry;
     createWater(shaders.water);
@@ -563,21 +567,26 @@ function createWater(waterShaders) {
     normalPlaceholder.needsUpdate = true;
     normalPlaceholder.wrapS = normalPlaceholder.wrapT = THREE.RepeatWrapping;
     
+    const terrainHeightTex = createTerrainHeightTexture(TERRAIN_SIZE);
+    
     const waterMaterial = new THREE.ShaderMaterial({
         uniforms: {
             uTime: { value: 0 },
             uDudvMap: { value: dudvPlaceholder },
             uNormalMap: { value: normalPlaceholder },
-            uWaterColor: { value: new THREE.Color(0x4a9ca8) },
-            uDeepColor: { value: new THREE.Color(0x2d6b7a) },
-            uSkyColor: { value: new THREE.Color(0xb8d4e3) },
-            uHorizonColor: { value: new THREE.Color(0xd4e8f0) },
+            uTerrainHeightMap: { value: terrainHeightTex },
+            uTerrainSize: { value: TERRAIN_SIZE },
+            uWaterLevel: { value: -5 },
+            uWaterColor: { value: new THREE.Color(0x5ab0c0) },
+            uDeepColor: { value: new THREE.Color(0x3d7a8a) },
+            uSkyColor: { value: new THREE.Color(0xc8e4f0) },
+            uHorizonColor: { value: new THREE.Color(0xe0f0f8) },
             uCameraPosition: { value: new THREE.Vector3(0, 0, 0) },
             uWaterSize: { value: waterSize },
             uMoveFactor: { value: 0 },
-            fogColor: { value: scene.fog ? scene.fog.color.clone() : new THREE.Color(0x87ceeb) },
-            fogNear: { value: scene.fog ? scene.fog.near : 400 },
-            fogFar: { value: scene.fog ? scene.fog.far : 1400 },
+            fogColor: { value: scene.fog ? scene.fog.color.clone() : new THREE.Color(0xb8dce8) },
+            fogNear: { value: scene.fog ? scene.fog.near : 2000 },
+            fogFar: { value: scene.fog ? scene.fog.far : 12000 },
         },
         vertexShader: waterShaders.vertexShader,
         fragmentShader: waterShaders.fragmentShader,
@@ -774,22 +783,14 @@ function createCannons() {
 }
 
 // ============ GET TERRAIN HEIGHT AT POSITION ============
-// Uses the SAME formula as terrain creation - guarantees trees and collision match terrain exactly
+// Uses terrainHeightAt - same formula as terrain creation (with edge falloff)
 function getTerrainHeight(worldX, worldZ) {
-    // Terrain: world = mesh.position + vertex => worldX = -1000 + geomX, so geomX = worldX + 1000
-    // Terrain creation used: noiseX = geomX + 1000, noiseZ = geomZ + 1000
-    // So noise coords = (worldX + 2000, worldZ + 2000)
     const x = worldX + TERRAIN_SIZE;
     const z = worldZ + TERRAIN_SIZE;
-    
     if (x < 0 || x > TERRAIN_SIZE * 2 || z < 0 || z > TERRAIN_SIZE * 2) {
-        return 0;
+        return -10;
     }
-    
-    const height = noise2D(x, z) + 
-                  noise2D(x * 2, z * 2) * 0.5 +
-                  Math.abs(Math.sin(x * 0.005) * Math.cos(z * 0.005)) * 15;
-    return height * 3;
+    return terrainHeightAt(x, z, TERRAIN_SIZE);
 }
 
 // ============ CREATE PLANE ============
@@ -1323,8 +1324,8 @@ async function init() {
     const shaders = await loadShaders();
     
     scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x87ceeb);
-    scene.fog = new THREE.Fog(0x87ceeb, 800, 6000);
+    scene.background = new THREE.Color(0xb8dce8);
+    scene.fog = new THREE.Fog(0xb8dce8, 2000, 12000);
     
     camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 15000);
     camera.position.set(0, 0, 15);
@@ -1337,7 +1338,7 @@ async function init() {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     document.getElementById('game-container').appendChild(renderer.domElement);
     
-    const ambient = new THREE.AmbientLight(0xe8f0f8, 0.85);
+    const ambient = new THREE.AmbientLight(0xf5faff, 1.0);
     scene.add(ambient);
     
     createSkybox(shaders.skybox);
