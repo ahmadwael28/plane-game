@@ -1,6 +1,5 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
-import { Sky } from 'three/addons/objects/Sky.js';
 
 // ============ GAME STATE ============
 // Terrain config - must be before planeState (which uses TERRAIN_SIZE)
@@ -11,6 +10,9 @@ let scene, camera, renderer;
 let plane, planeGroup;
 let terrain, terrainGeometry;
 let water = null;  // Water mesh for ripple animation
+let sunMesh = null;  // Visible sun disc in sky
+const SUN_POSITION = new THREE.Vector3(400, 800, 200);  // World position of sun
+const LIGHT_POSITION = new THREE.Vector3(-800, 120, -600);  // Secondary light (e.g. distant)
 let trees = [];  // Tree instances for collision
 let cannons = [];  // Ground cannons - fire homing missiles
 let initialCannonCount = 0;  // For kills/remaining display
@@ -69,6 +71,425 @@ const cameraOrbit = {
 
 // Optional: Set to a URL to load a custom plane GLB model (e.g. from Sketchfab download)
 const PLANE_MODEL_URL = null;  // e.g. 'models/plane.glb'
+
+// ============ AUDIO (Web Audio API - procedural sounds, no external files) ============
+let audioCtx = null;
+let engineOsc = null;
+let engineGain = null;
+
+function initAudio() {
+    if (audioCtx) return;
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    // Engine: low rumble that varies with speed
+    engineOsc = audioCtx.createOscillator();
+    engineOsc.type = 'sawtooth';
+    engineOsc.frequency.setValueAtTime(80, audioCtx.currentTime);
+    engineGain = audioCtx.createGain();
+    engineGain.gain.setValueAtTime(0, audioCtx.currentTime);
+    const engineFilter = audioCtx.createBiquadFilter();
+    engineFilter.type = 'lowpass';
+    engineFilter.frequency.value = 400;
+    engineOsc.connect(engineFilter);
+    engineFilter.connect(engineGain);
+    engineGain.connect(audioCtx.destination);
+    engineOsc.start();
+}
+
+function resumeAudio() {
+    if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume();
+    }
+}
+
+function playEngineSound(speed) {
+    if (!audioCtx || !engineOsc || !engineGain) return;
+    const normalized = (speed - 20) / 100;
+    const freq = 60 + normalized * 90;
+    const vol = 0.08 + normalized * 0.06;
+    engineOsc.frequency.setTargetAtTime(freq, audioCtx.currentTime, 0.1);
+    engineGain.gain.setTargetAtTime(vol, audioCtx.currentTime, 0.05);
+}
+
+function stopEngineSound() {
+    if (engineGain) {
+        engineGain.gain.setTargetAtTime(0, audioCtx.currentTime, 0.2);
+    }
+}
+
+// Create PannerNode for positional audio (distant sounds quieter)
+function createPanner(pos) {
+    const panner = audioCtx.createPanner();
+    panner.panningModel = 'HRTF';
+    panner.distanceModel = 'inverse';
+    panner.refDistance = 80;
+    panner.maxDistance = 2500;
+    panner.rolloffFactor = 1;
+    panner.coneInnerAngle = 360;
+    panner.coneOuterAngle = 360;
+    if (panner.positionX) {
+        panner.positionX.value = pos.x;
+        panner.positionY.value = pos.y;
+        panner.positionZ.value = pos.z;
+    } else {
+        panner.setPosition(pos.x, pos.y, pos.z);
+    }
+    return panner;
+}
+
+function updateAudioListener() {
+    if (!audioCtx || !camera) return;
+    const listener = audioCtx.listener;
+    if (listener.positionX) {
+        listener.positionX.setValueAtTime(camera.position.x, audioCtx.currentTime);
+        listener.positionY.setValueAtTime(camera.position.y, audioCtx.currentTime);
+        listener.positionZ.setValueAtTime(camera.position.z, audioCtx.currentTime);
+        if (listener.forwardX) {
+            const dir = new THREE.Vector3();
+            camera.getWorldDirection(dir);
+            listener.forwardX.setValueAtTime(dir.x, audioCtx.currentTime);
+            listener.forwardY.setValueAtTime(dir.y, audioCtx.currentTime);
+            listener.forwardZ.setValueAtTime(dir.z, audioCtx.currentTime);
+        }
+    } else if (listener.setPosition) {
+        listener.setPosition(camera.position.x, camera.position.y, camera.position.z);
+    }
+}
+
+function playMissileFire() {
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    const duration = 0.25;
+    const pos = planeState.position;
+    const panner = createPanner(pos);
+    const merger = audioCtx.createGain();
+    merger.gain.value = 1;
+    merger.connect(panner);
+    panner.connect(audioCtx.destination);
+
+    // Ignition burst - sharp combustion crackle
+    const burstSize = Math.floor(audioCtx.sampleRate * 0.04);
+    const burstBuffer = audioCtx.createBuffer(1, burstSize, audioCtx.sampleRate);
+    const burstData = burstBuffer.getChannelData(0);
+    for (let i = 0; i < burstSize; i++) {
+        burstData[i] = (Math.random() * 2 - 1) * Math.exp(-i / (burstSize * 0.3));
+    }
+    const burst = audioCtx.createBufferSource();
+    burst.buffer = burstBuffer;
+    const burstFilter = audioCtx.createBiquadFilter();
+    burstFilter.type = 'bandpass';
+    burstFilter.frequency.value = 800;
+    burstFilter.Q.value = 2;
+    const burstGain = audioCtx.createGain();
+    burstGain.gain.setValueAtTime(0.2, t);
+    burstGain.gain.exponentialRampToValueAtTime(0.001, t + 0.04);
+    burst.connect(burstFilter);
+    burstFilter.connect(burstGain);
+    burstGain.connect(merger);
+
+    // Rocket motor rumble - filtered noise (engine roar)
+    const rumbleSize = Math.floor(audioCtx.sampleRate * duration);
+    const rumbleBuffer = audioCtx.createBuffer(1, rumbleSize, audioCtx.sampleRate);
+    const rumbleData = rumbleBuffer.getChannelData(0);
+    let prev = 0;
+    for (let i = 0; i < rumbleSize; i++) {
+        const decay = Math.pow(1 - i / rumbleSize, 2);
+        prev = prev * 0.85 + (Math.random() * 2 - 1) * 0.3;
+        rumbleData[i] = prev * decay;
+    }
+    const rumble = audioCtx.createBufferSource();
+    rumble.buffer = rumbleBuffer;
+    const rumbleFilter = audioCtx.createBiquadFilter();
+    rumbleFilter.type = 'lowpass';
+    rumbleFilter.frequency.value = 350;
+    rumbleFilter.Q.value = 0.7;
+    const rumbleGain = audioCtx.createGain();
+    rumbleGain.gain.setValueAtTime(0, t);
+    rumbleGain.gain.linearRampToValueAtTime(0.12, t + 0.01);
+    rumbleGain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+    rumble.connect(rumbleFilter);
+    rumbleFilter.connect(rumbleGain);
+    rumbleGain.connect(merger);
+
+    burst.start(t);
+    burst.stop(t + 0.04);
+    rumble.start(t);
+    rumble.stop(t + duration);
+}
+
+// Continuous propelling sound - "sssshhhh" hiss (looped filtered noise)
+function startMissilePropellingSound(pos) {
+    if (!audioCtx) return { stop: () => {}, updatePosition: () => {} };
+    const panner = createPanner(pos);
+    const bufferSize = Math.floor(audioCtx.sampleRate * 0.4);
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    let prev = 0;
+    for (let i = 0; i < bufferSize; i++) {
+        prev = prev * 0.7 + (Math.random() * 2 - 1) * 0.4;
+        data[i] = prev;
+    }
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    const filter = audioCtx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 3500;
+    filter.Q.value = 0.5;
+    const gain = audioCtx.createGain();
+    gain.gain.value = 0.07;
+    source.connect(filter);
+    filter.connect(gain);
+    gain.connect(panner);
+    panner.connect(audioCtx.destination);
+    source.start();
+    return {
+        stop: () => {
+            gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.08);
+            setTimeout(() => {
+                source.stop();
+                try { gain.disconnect(); panner.disconnect(); } catch (_) {}
+            }, 150);
+        },
+        updatePosition: (p) => {
+            if (panner.positionX) {
+                panner.positionX.value = p.x;
+                panner.positionY.value = p.y;
+                panner.positionZ.value = p.z;
+            }
+        }
+    };
+}
+
+// Create smoke/cloud particle trail for a missile
+function createMissileTrail(color) {
+    const maxParticles = 120;
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(maxParticles * 3);
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const smokeTexture = createSmokeTexture();
+    const material = new THREE.PointsMaterial({
+        map: smokeTexture,
+        transparent: true,
+        opacity: 0.75,
+        size: 6,
+        sizeAttenuation: true,
+        depthWrite: false,
+        blending: THREE.NormalBlending,
+        vertexColors: false,
+        color,
+    });
+    const points = new THREE.Points(geometry, material);
+    points.frustumCulled = false;
+    return {
+        line: points,
+        particles: [],
+        maxParticles,
+        addPoint(pos, velDir) {
+            if (this.particles.length >= this.maxParticles) this.particles.shift();
+            const backward = velDir ? velDir.clone().normalize().multiplyScalar(-1) : new THREE.Vector3(0, 0, 1);
+            const offset = backward.multiplyScalar(2).add(new THREE.Vector3(
+                (Math.random() - 0.5) * 2,
+                (Math.random() - 0.5) * 2,
+                (Math.random() - 0.5) * 2
+            ));
+            this.particles.push({
+                position: pos.clone().add(offset),
+                velocity: new THREE.Vector3(
+                    (Math.random() - 0.5) * 3,
+                    (Math.random() - 0.5) * 3,
+                    (Math.random() - 0.5) * 3
+                ),
+                life: 1,
+                decay: 0.06 + Math.random() * 0.05,
+            });
+        },
+        update(delta) {
+            const attr = this.line.geometry.attributes.position;
+            let alive = 0;
+            for (let i = this.particles.length - 1; i >= 0; i--) {
+                const p = this.particles[i];
+                p.position.add(p.velocity.clone().multiplyScalar(delta));
+                p.velocity.y += 0.5 * delta;
+                p.life -= p.decay * delta;
+                if (p.life <= 0) {
+                    this.particles.splice(i, 1);
+                    continue;
+                }
+                attr.setXYZ(alive, p.position.x, p.position.y, p.position.z);
+                alive++;
+            }
+            attr.needsUpdate = true;
+            this.line.geometry.setDrawRange(0, alive);
+        }
+    };
+}
+
+function createSmokeTexture() {
+    const size = 64;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const g = ctx.createRadialGradient(size/2, size/2, 0, size/2, size/2, size/2);
+    g.addColorStop(0, 'rgba(255, 255, 255, 0.9)');
+    g.addColorStop(0.3, 'rgba(255, 255, 255, 0.5)');
+    g.addColorStop(0.6, 'rgba(255, 255, 255, 0.15)');
+    g.addColorStop(1, 'rgba(255, 255, 255, 0)');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, size, size);
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.needsUpdate = true;
+    return texture;
+}
+
+function playExplosion(pos, isBig = false) {
+    if (!audioCtx) return;
+    const t = audioCtx.currentTime;
+    const duration = isBig ? 0.8 : 0.5;
+    const vol = isBig ? 0.5 : 0.25;
+    const panner = createPanner(pos);
+    const merger = audioCtx.createGain();
+    merger.gain.value = 1;
+    merger.connect(panner);
+    panner.connect(audioCtx.destination);
+
+    // Layer 1: Bass thump - deep impact punch (40-60 Hz)
+    const thumpOsc = audioCtx.createOscillator();
+    const thumpGain = audioCtx.createGain();
+    thumpOsc.type = 'sine';
+    thumpOsc.frequency.setValueAtTime(55, t);
+    thumpOsc.frequency.exponentialRampToValueAtTime(25, t + 0.08);
+    thumpGain.gain.setValueAtTime(0, t);
+    thumpGain.gain.linearRampToValueAtTime(vol * 1.2, t + 0.01);
+    thumpGain.gain.exponentialRampToValueAtTime(0.001, t + duration * 0.4);
+    thumpOsc.connect(thumpGain);
+    thumpGain.connect(merger);
+    thumpOsc.start(t);
+    thumpOsc.stop(t + duration * 0.4);
+
+    // Layer 2: Rumble - brown-ish noise (low-pass filtered for realism)
+    const bufferSize = Math.floor(audioCtx.sampleRate * duration);
+    const buffer = audioCtx.createBuffer(1, bufferSize, audioCtx.sampleRate);
+    const data = buffer.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < bufferSize; i++) {
+        const decay = Math.pow(1 - i / bufferSize, 1.5);
+        last = last * 0.96 + (Math.random() * 2 - 1) * 0.2;
+        data[i] = last * decay * 0.8;
+    }
+    const noise = audioCtx.createBufferSource();
+    noise.buffer = buffer;
+    const noiseFilter = audioCtx.createBiquadFilter();
+    noiseFilter.type = 'lowpass';
+    noiseFilter.frequency.value = isBig ? 400 : 600;
+    noiseFilter.Q.value = 0.5;
+    const noiseGain = audioCtx.createGain();
+    noiseGain.gain.setValueAtTime(0, t);
+    noiseGain.gain.linearRampToValueAtTime(vol * 0.9, t + 0.02);
+    noiseGain.gain.exponentialRampToValueAtTime(0.001, t + duration);
+    noise.connect(noiseFilter);
+    noiseFilter.connect(noiseGain);
+    noiseGain.connect(merger);
+    noise.start(t);
+    noise.stop(t + duration);
+
+    // Layer 3: Sharp crack - brief high-mid transient for impact
+    const crackBuffer = audioCtx.createBuffer(1, Math.floor(audioCtx.sampleRate * 0.06), audioCtx.sampleRate);
+    const crackData = crackBuffer.getChannelData(0);
+    for (let i = 0; i < crackData.length; i++) {
+        crackData[i] = (Math.random() * 2 - 1) * Math.exp(-i / (crackData.length * 0.15));
+    }
+    const crack = audioCtx.createBufferSource();
+    crack.buffer = crackBuffer;
+    const crackFilter = audioCtx.createBiquadFilter();
+    crackFilter.type = 'bandpass';
+    crackFilter.frequency.value = 1200;
+    crackFilter.Q.value = 1;
+    const crackGain = audioCtx.createGain();
+    crackGain.gain.setValueAtTime(vol * 0.4, t);
+    crackGain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+    crack.connect(crackFilter);
+    crackFilter.connect(crackGain);
+    crackGain.connect(merger);
+    crack.start(t);
+    crack.stop(t + 0.06);
+}
+
+function playCrash(pos) {
+    if (!audioCtx) return;
+    playExplosion(pos, true);
+    const t = audioCtx.currentTime;
+    const panner = createPanner(pos);
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(80, t);
+    osc.frequency.exponentialRampToValueAtTime(30, t + 0.5);
+    gain.gain.setValueAtTime(0.25, t);
+    gain.gain.exponentialRampToValueAtTime(0.01, t + 0.5);
+    osc.connect(gain);
+    gain.connect(panner);
+    panner.connect(audioCtx.destination);
+    osc.start(t);
+    osc.stop(t + 0.5);
+}
+
+// ============ CREATE SKYBOX ============
+// Procedural gradient skybox - no external textures needed
+// Large inverted box with gradient shader (zenith to horizon)
+function createSkybox() {
+    const skyboxSize = 50000;  // Surrounds the entire play area
+    const geometry = new THREE.BoxGeometry(skyboxSize, skyboxSize, skyboxSize);
+    
+    const skyboxMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+            uSunDirection: { value: new THREE.Vector3(0.2, 0.5, 0.3).normalize() },
+            uZenithColor: { value: new THREE.Color(0x1a3a5c) },   // Deep blue at top
+            uHorizonColor: { value: new THREE.Color(0x87ceeb) },   // Light blue at horizon
+            uGroundColor: { value: new THREE.Color(0xb0c4de) },    // Lighter below horizon
+            uSunGlow: { value: 0.5 },
+        },
+        vertexShader: `
+            varying vec3 vWorldPosition;
+            varying vec3 vViewDirection;
+            void main() {
+                vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                vWorldPosition = worldPos.xyz;
+                vViewDirection = (modelViewMatrix * vec4(position, 1.0)).xyz;
+                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+            }
+        `,
+        fragmentShader: `
+            uniform vec3 uSunDirection;
+            uniform vec3 uZenithColor;
+            uniform vec3 uHorizonColor;
+            uniform vec3 uGroundColor;
+            uniform float uSunGlow;
+            varying vec3 vWorldPosition;
+            varying vec3 vViewDirection;
+            void main() {
+                vec3 dir = normalize(vWorldPosition);
+                float h = dir.y;  // -1 at bottom, 1 at top
+                float t = smoothstep(-0.1, 0.5, h);
+                vec3 skyColor = mix(uHorizonColor, uZenithColor, t);
+                float groundMask = smoothstep(0.0, -0.05, h);
+                skyColor = mix(skyColor, uGroundColor, groundMask);
+                float sunDot = max(0.0, dot(normalize(vViewDirection), uSunDirection));
+                float sunGlow = pow(sunDot, 8.0) * uSunGlow;
+                skyColor += vec3(1.0, 0.95, 0.85) * sunGlow;
+                gl_FragColor = vec4(skyColor, 1.0);
+            }
+        `,
+        side: THREE.BackSide,
+        depthWrite: false,
+        depthTest: true,
+    });
+    
+    const skybox = new THREE.Mesh(geometry, skyboxMaterial);
+    skybox.frustumCulled = false;
+    skybox.renderOrder = -1000;  // Render first (behind everything)
+    scene.add(skybox);
+}
 
 // ============ CREATE SKY ============
 function createSky(sunLight) {
@@ -189,32 +610,84 @@ function createTerrain() {
     return terrain;
 }
 
-// ============ CREATE WATER (steady with subtle ripples & sun glare) ============
+// ============ CREATE WATER (matches uni GP WaterRenderer - DuDv ripple, normal map) ============
+// Uses waterDUDV.png + normal.png from uni GP, or procedural fallback
 function createWater() {
     const waterSize = 12000;
-    const waterGeometry = new THREE.PlaneGeometry(waterSize, waterSize);
+    const waterGeometry = new THREE.PlaneGeometry(waterSize, waterSize, 96, 96);
     waterGeometry.rotateX(-Math.PI / 2);
     
-    const sunDir = new THREE.Vector3(100, 200, 50).normalize();
+    const sunDir = SUN_POSITION.clone().normalize();
+    
+    const dudvPlaceholder = new THREE.DataTexture(new Uint8Array([128, 128, 255, 255]), 1, 1);
+    dudvPlaceholder.needsUpdate = true;
+    dudvPlaceholder.wrapS = dudvPlaceholder.wrapT = THREE.RepeatWrapping;
+    
+    const normalPlaceholder = new THREE.DataTexture(new Uint8Array([128, 128, 255, 255]), 1, 1);
+    normalPlaceholder.needsUpdate = true;
+    normalPlaceholder.wrapS = normalPlaceholder.wrapT = THREE.RepeatWrapping;
     
     const waterMaterial = new THREE.ShaderMaterial({
         uniforms: {
             uTime: { value: 0 },
-            uWaterColor: { value: new THREE.Color(0x1e6fcc) },
-            uSkyColor: { value: new THREE.Color(0x87ceeb) },
+            uDudvMap: { value: dudvPlaceholder },
+            uNormalMap: { value: normalPlaceholder },
+            uWaterColor: { value: new THREE.Color(0x4a9ca8) },
+            uDeepColor: { value: new THREE.Color(0x2d6b7a) },
+            uSkyColor: { value: new THREE.Color(0xb8d4e3) },
+            uHorizonColor: { value: new THREE.Color(0xd4e8f0) },
             uSunDirection: { value: sunDir },
+            uSunPosition: { value: SUN_POSITION.clone() },
+            uSunColor: { value: new THREE.Color(0xfff8e8) },
+            uLightPosition: { value: LIGHT_POSITION.clone() },
+            uLightColor: { value: new THREE.Color(0xffeedd) },
+            uCameraPosition: { value: new THREE.Vector3(0, 0, 0) },
+            uWaterSize: { value: waterSize },
+            uMoveFactor: { value: 0 },
             fogColor: { value: scene.fog ? scene.fog.color.clone() : new THREE.Color(0x87ceeb) },
             fogNear: { value: scene.fog ? scene.fog.near : 400 },
             fogFar: { value: scene.fog ? scene.fog.far : 1400 },
         },
         vertexShader: `
-            varying vec2 vUv;
+            uniform float uTime;
+            uniform float uWaterSize;
+            varying vec2 textureCoords;
             varying vec3 vViewPosition;
+            varying vec3 vWorldPosition;
+            varying vec3 vNormal;
             varying float vFogDepth;
             
+            #define PI 3.14159265359
+            
+            vec3 gerstnerWave(vec2 uv, vec2 dir, float steepness, float wavelength, float t, inout vec3 tangent, inout vec3 binormal) {
+                float k = 2.0 * PI / wavelength;
+                float c = sqrt(9.8 / k);
+                vec2 d = normalize(dir);
+                float f = k * (dot(d, uv) - c * t);
+                float a = steepness / k;
+                tangent += vec3(-d.x * d.x * (steepness * sin(f)), d.x * (steepness * cos(f)), -d.x * d.y * (steepness * sin(f)));
+                binormal += vec3(-d.x * d.y * (steepness * sin(f)), d.y * (steepness * cos(f)), -d.y * d.y * (steepness * sin(f)));
+                return vec3(d.x * (a * cos(f)), a * sin(f), d.y * (a * cos(f)));
+            }
+            
+            const float tiling = 64.0;
             void main() {
-                vUv = uv;
-                vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+                vec2 pos = vec2(position.x, position.z);
+                vec2 baseCoords = vec2(position.x / uWaterSize + 0.5, position.z / uWaterSize + 0.5);
+                textureCoords = baseCoords * tiling;
+                
+                vec3 tangent = vec3(1.0, 0.0, 0.0);
+                vec3 binormal = vec3(0.0, 0.0, 1.0);
+                vec3 disp = vec3(0.0);
+                disp += gerstnerWave(pos, vec2(1.0, 0.3), 0.01, 16.0, uTime * 0.6, tangent, binormal);
+                disp += gerstnerWave(pos, vec2(-0.7, 0.6), 0.008, 12.0, uTime * 0.5, tangent, binormal);
+                disp += gerstnerWave(pos, vec2(0.4, -0.9), 0.006, 10.0, uTime * 0.4, tangent, binormal);
+                disp += gerstnerWave(pos, vec2(-0.2, -0.5), 0.005, 8.0, uTime * 0.35, tangent, binormal);
+                vec3 newPos = vec3(position.x, 0.0, position.z) + disp * 0.5;
+                vec4 worldPos = modelMatrix * vec4(newPos, 1.0);
+                vWorldPosition = worldPos.xyz;
+                vNormal = normalize(cross(binormal, tangent));
+                vec4 mvPosition = modelViewMatrix * vec4(newPos, 1.0);
                 vViewPosition = -mvPosition.xyz;
                 vFogDepth = -mvPosition.z;
                 gl_Position = projectionMatrix * mvPosition;
@@ -223,35 +696,152 @@ function createWater() {
         fragmentShader: `
             uniform float uTime;
             uniform vec3 uWaterColor;
+            uniform vec3 uDeepColor;
             uniform vec3 uSkyColor;
+            uniform vec3 uHorizonColor;
             uniform vec3 uSunDirection;
+            uniform vec3 uSunPosition;
+            uniform vec3 uSunColor;
+            uniform vec3 uLightPosition;
+            uniform vec3 uLightColor;
+            uniform vec3 uCameraPosition;
+            uniform float uWaterSize;
+            uniform float uMoveFactor;
+            uniform sampler2D uDudvMap;
+            uniform sampler2D uNormalMap;
             uniform vec3 fogColor;
             uniform float fogNear;
             uniform float fogFar;
-            varying vec2 vUv;
+            varying vec2 textureCoords;
             varying vec3 vViewPosition;
+            varying vec3 vWorldPosition;
+            varying vec3 vNormal;
             varying float vFogDepth;
             
+            float hash(vec2 p) {
+                return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+            }
+            float hash(vec2 p, float t) {
+                return fract(sin(dot(p + t, vec2(127.1, 311.7))) * 43758.5453);
+            }
+            float simplexNoise(vec2 p) {
+                vec2 i = floor(p);
+                vec2 f = fract(p);
+                float a = hash(i);
+                float b = hash(i + vec2(1.0, 0.0));
+                float c = hash(i + vec2(0.0, 1.0));
+                float d = hash(i + vec2(1.0, 1.0));
+                vec2 u = f * f * (3.0 - 2.0 * f);
+                return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+            }
+            float fbm(vec2 p) {
+                float v = 0.0, a = 0.5, f = 1.0;
+                for (int i = 0; i < 4; i++) {
+                    v += a * simplexNoise(p * f + uTime * 0.25);
+                    a *= 0.5;
+                    f *= 2.0;
+                }
+                return v;
+            }
+            vec3 getRippleNormal(vec2 pos) {
+                float eps = 1.5;
+                float h = fbm(pos * 0.28);
+                float hx = fbm(pos * 0.28 + vec2(eps, 0.0));
+                float hz = fbm(pos * 0.28 + vec2(0.0, eps));
+                vec3 smallRipple = normalize(vec3(h - hx, 1.0, h - hz));
+                return normalize(vNormal + smallRipple * 0.35);
+            }
+            
+            vec2 sampleDudv(vec2 uv) {
+                return texture2D(uDudvMap, uv).rg;
+            }
+            
+            vec3 baseWaterColor() {
+                return vec3(0.0, 0.0, 1.0);
+            }
+            
+            // Procedural environment: sample sky/horizon based on reflection direction (world-space R)
+            vec3 sampleEnvironment(vec3 R) {
+                float y = R.y;
+                vec3 zenithColor = uSkyColor;
+                vec3 horizonColor = uHorizonColor;
+                vec3 groundColor = uDeepColor;
+                float t = smoothstep(-0.15, 0.0, y);
+                vec3 lower = mix(groundColor, horizonColor, t);
+                t = smoothstep(0.0, 0.4, y);
+                vec3 mid = mix(horizonColor, zenithColor, t);
+                t = smoothstep(0.4, 1.0, y);
+                vec3 env = mix(mid, zenithColor, t);
+                vec3 toSun = normalize(uSunPosition);
+                float sunDot = max(dot(R, toSun), 0.0);
+                float sunDisc = pow(sunDot, 64.0);
+                env += uSunColor * sunDisc * 2.0;
+                float lightDot = max(dot(R, normalize(uLightPosition - vWorldPosition)), 0.0);
+                env += uLightColor * pow(lightDot, 32.0) * 0.8;
+                return env;
+            }
+            
+            const float tiling = 64.0;
             void main() {
+                const float waveStrength = 0.012;
+                const float shineDamper = 20.0;
+                const float reflectivity = 0.5;
+                
+                vec2 dudvSample1 = sampleDudv(vec2(textureCoords.x + uMoveFactor, textureCoords.y)) * 0.1;
+                vec2 distortedTexCoords = textureCoords + vec2(dudvSample1.x, dudvSample1.y + uMoveFactor);
+                vec2 totalDistortion = (sampleDudv(distortedTexCoords) * 2.0 - 1.0) * waveStrength;
+                
+                vec4 normalMapColour = texture2D(uNormalMap, distortedTexCoords);
+                vec3 normalFromMap = normalize(vec3(normalMapColour.r * 2.0 - 1.0, normalMapColour.b * 3.0, normalMapColour.g * 2.0 - 1.0));
+                
+                vec3 viewDirWorld = normalize(uCameraPosition - vWorldPosition);
                 vec3 viewDir = normalize(vViewPosition);
-                vec3 normal = vec3(0.0, 1.0, 0.0);
+                vec2 uv = (textureCoords / tiling) * uWaterSize * 0.001;
+                vec3 N = normalize(vNormal + normalFromMap * 0.6);
                 
-                // Subtle ripple - tiny normal variation for glitter/shimmer (no waves)
-                float rx = sin(vUv.x * 60.0 + uTime * 1.5) * sin(vUv.y * 40.0 + uTime) * 0.02;
-                float rz = sin(vUv.x * 40.0 + uTime) * sin(vUv.y * 60.0 + uTime * 1.2) * 0.02;
-                vec3 rippleNormal = normalize(vec3(rx, 1.0, rz));
+                float NdotV = max(dot(N, viewDir), 0.0);
+                float F0 = 0.02;
+                float fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
                 
-                // Fresnel - sky reflection at grazing angles
-                float fresnel = pow(1.0 - max(dot(viewDir, rippleNormal), 0.0), 2.5);
-                vec3 reflectColor = mix(uWaterColor, uSkyColor, fresnel * 0.7);
+                vec3 R = reflect(-viewDirWorld, N);
+                R.xz += totalDistortion * 0.8;
+                R = normalize(R);
+                vec3 envReflection = sampleEnvironment(R);
                 
-                // Sun glare - strong specular highlight
+                // Roughness: sample with perturbed normals for distorted, broken-up reflection
+                vec3 N1 = getRippleNormal(uv + vec2(1.5, 0.0));
+                vec3 N2 = getRippleNormal(uv + vec2(0.0, 1.5));
+                vec3 N3 = getRippleNormal(uv + vec2(1.0, 1.0));
+                vec3 N4 = getRippleNormal(uv + vec2(-1.0, 0.5));
+                vec3 R1 = reflect(-viewDirWorld, N1);
+                vec3 R2 = reflect(-viewDirWorld, N2);
+                vec3 R3 = reflect(-viewDirWorld, N3);
+                vec3 R4 = reflect(-viewDirWorld, N4);
+                envReflection = (envReflection + sampleEnvironment(R1) + sampleEnvironment(R2) + sampleEnvironment(R3) + sampleEnvironment(R4)) / 5.0;
+                
+                vec3 deepColor = mix(baseWaterColor(), uDeepColor, 0.6);
+                vec3 reflectColor = mix(deepColor, envReflection, fresnel * 0.95);
+                
+                vec3 toLight = normalize(uLightPosition - vWorldPosition);
+                vec3 reflectedLight = reflect(-toLight, N);
+                float specular = max(dot(reflectedLight, viewDir), 0.0);
+                specular = pow(specular, shineDamper);
+                vec3 specularHighlights = uLightColor * specular * reflectivity;
+                
                 vec3 halfDir = normalize(viewDir + uSunDirection);
-                float spec = pow(max(dot(rippleNormal, halfDir), 0.0), 64.0);
-                vec3 glare = vec3(1.0, 0.98, 0.9) * spec * 1.2;
+                float NdotH = max(dot(N, halfDir), 0.0);
+                float sunSpec = pow(NdotH, shineDamper);
+                vec3 sunGlare = uSunColor * sunSpec * reflectivity * 2.0;
                 
-                vec3 finalColor = reflectColor + glare;
-                float alpha = 0.92;
+                vec3 R_light = reflect(-viewDir, N);
+                float lightSpec = pow(max(dot(R_light, toLight), 0.0), 32.0);
+                float lightDist = length(uLightPosition - vWorldPosition);
+                float lightAtten = 1.0 / (1.0 + lightDist * 0.0008);
+                vec3 lightReflection = uLightColor * lightSpec * lightAtten * 1.5;
+                
+                vec3 finalColor = reflectColor + sunGlare + specularHighlights + lightReflection;
+                finalColor = mix(finalColor, vec3(0.0, 0.3, 0.5), 0.2);
+                float alpha = mix(0.45, 0.72, fresnel);
                 
                 vec4 baseColor = vec4(finalColor, alpha);
                 float fogFactor = clamp((fogFar - vFogDepth) / (fogFar - fogNear), 0.0, 1.0);
@@ -268,6 +858,16 @@ function createWater() {
     water.position.set(-TERRAIN_SIZE / 2, -5, -TERRAIN_SIZE / 2);
     water.receiveShadow = true;
     scene.add(water);
+    
+    const loader = new THREE.TextureLoader();
+    loader.load('textures/waterDUDV.png', (tex) => {
+        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+        if (water && water.material.uniforms) water.material.uniforms.uDudvMap.value = tex;
+    });
+    loader.load('textures/normal.png', (tex) => {
+        tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+        if (water && water.material.uniforms) water.material.uniforms.uNormalMap.value = tex;
+    });
 }
 
 // ============ CREATE TREES ============
@@ -771,6 +1371,10 @@ function firePlayerMissile() {
     const missileSpeed = 180;
     const initialVel = forward.clone().multiplyScalar(missileSpeed);
     
+    const trail = createMissileTrail(0xd0d8e0);
+    scene.add(trail.line);
+    const propellingSound = startMissilePropellingSound(spawnPos.clone());
+    
     missile.userData = {
         position: spawnPos.clone(),
         velocity: initialVel,
@@ -778,6 +1382,8 @@ function firePlayerMissile() {
         spawnTime: performance.now(),
         target: lockedCannon,
         homingStrength: 2.2,
+        trail,
+        propellingSound,
     };
     
     missile.position.copy(spawnPos);
@@ -785,10 +1391,11 @@ function firePlayerMissile() {
     missile.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), dir);
     scene.add(missile);
     playerMissiles.push(missile);
+    playMissileFire();
 }
 
 // ============ CREATE EXPLOSION/FIRE ============
-function createExplosion(pos) {
+function createExplosion(pos, playSound = true, isBig = false) {
     const particleCount = 200;
     const geometry = new THREE.BufferGeometry();
     const positions = new Float32Array(particleCount * 3);
@@ -828,6 +1435,7 @@ function createExplosion(pos) {
     particles.userData = { velocities, startTime: Date.now() };
     scene.add(particles);
     explosionParticles.push(particles);
+    if (playSound) playExplosion(pos, isBig);
 }
 
 // ============ FIRE HOMING MISSILE ============
@@ -836,11 +1444,17 @@ function fireMissile(fromPos) {
     missile.scale.setScalar(1.8);
     const spawnPos = fromPos.clone().add(new THREE.Vector3(0, 0.5, 0));
     const toPlayer = planeState.position.clone().sub(spawnPos).normalize();
+    const trail = createMissileTrail(0xc8d0d8);
+    scene.add(trail.line);
+    const propellingSound = startMissilePropellingSound(spawnPos.clone());
+    
     missile.userData = {
         position: spawnPos.clone(),
         velocity: toPlayer.clone().multiplyScalar(65),
         active: true,
         spawnTime: performance.now(),
+        trail,
+        propellingSound,
     };
     missile.position.copy(spawnPos);
     missile.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, -1), toPlayer);
@@ -918,6 +1532,10 @@ function triggerCrash(skipUI = false) {
     crashed = true;
     shotDownFalling = false;
     gameOver = true;
+    stopEngineSound();
+    
+    const crashPos = plane ? plane.position.clone() : planeState.position.clone();
+    playCrash(crashPos);
     
     if (!skipUI) {
         if (hitByMissile) {
@@ -926,15 +1544,13 @@ function triggerCrash(skipUI = false) {
             showGameOver('CRASHED!', 'You hit the terrain at full speed');
         }
     }
-    
-    const crashPos = plane ? plane.position.clone() : planeState.position.clone();
     const terrainH = getTerrainHeight(crashPos.x, crashPos.z);
     crashPos.y = terrainH + 0.5;
     
-    // Initial explosion burst
-    createExplosion(crashPos);
-    createExplosion(crashPos.clone().add(new THREE.Vector3(2, 1, 0)));
-    createExplosion(crashPos.clone().add(new THREE.Vector3(-1, 0.5, 1)));
+    // Initial explosion burst (playCrash handles main sound; explosions are visual only here)
+    createExplosion(crashPos, false);
+    createExplosion(crashPos.clone().add(new THREE.Vector3(2, 1, 0)), false);
+    createExplosion(crashPos.clone().add(new THREE.Vector3(-1, 0.5, 1)), false);
     
     // Drop burning wreck to ground and keep it visible in flames
     if (plane) {
@@ -958,7 +1574,7 @@ function triggerCrash(skipUI = false) {
     const crashInterval = setInterval(() => {
         createExplosion(crashPos.clone().add(
             new THREE.Vector3((Math.random() - 0.5) * 8, Math.random() * 2, (Math.random() - 0.5) * 8)
-        ));
+        ), false);
         createGroundFire(crashPos.clone().add(
             new THREE.Vector3((Math.random() - 0.5) * 4, 0, (Math.random() - 0.5) * 4)
         ), 4);
@@ -1007,12 +1623,12 @@ function init() {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     document.getElementById('game-container').appendChild(renderer.domElement);
     
-    // Lights
-    const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+    // Lights - softer for natural water reflections
+    const ambient = new THREE.AmbientLight(0xe8f0f8, 0.7);
     scene.add(ambient);
     
-    const sun = new THREE.DirectionalLight(0xffffee, 1);
-    sun.position.set(100, 200, 50);
+    const sun = new THREE.DirectionalLight(0xfff5e6, 0.95);
+    sun.position.copy(SUN_POSITION);
     sun.castShadow = true;
     sun.shadow.mapSize.width = 2048;
     sun.shadow.mapSize.height = 2048;
@@ -1024,7 +1640,31 @@ function init() {
     sun.shadow.camera.bottom = -200;
     scene.add(sun);
     
-    createSky(sun);
+    // Visible sun disc in sky
+    const sunGeom = new THREE.SphereGeometry(120, 16, 16);
+    const sunMat = new THREE.MeshBasicMaterial({
+        color: 0xfff5e0,
+        transparent: true,
+        opacity: 0.95,
+    });
+    sunMesh = new THREE.Mesh(sunGeom, sunMat);
+    sunMesh.position.copy(SUN_POSITION);
+    sunMesh.frustumCulled = false;
+    sunMesh.renderOrder = 5;
+    scene.add(sunMesh);
+    
+    // Secondary point light - creates distinct reflection on water
+    const pointLight = new THREE.PointLight(0xffeedd, 0.8, 1200);
+    pointLight.position.copy(LIGHT_POSITION);
+    scene.add(pointLight);
+    const lightMesh = new THREE.Mesh(
+        new THREE.SphereGeometry(8, 8, 8),
+        new THREE.MeshBasicMaterial({ color: 0xffeedd })
+    );
+    lightMesh.position.copy(LIGHT_POSITION);
+    scene.add(lightMesh);
+    
+    createSkybox();  // Gradient skybox (replaces Sky for cleaner look)
     createClouds();
     createTerrain();
     createPlane();
@@ -1068,6 +1708,17 @@ function init() {
     }, { passive: false });
     
     document.getElementById('restart-btn').addEventListener('click', restart);
+    
+    // Init audio on first interaction (mousemove, keydown, or click - browser requires user gesture)
+    const initAudioOnInteraction = () => {
+        initAudio();
+        document.removeEventListener('mousemove', initAudioOnInteraction);
+        document.removeEventListener('keydown', initAudioOnInteraction);
+        document.removeEventListener('click', initAudioOnInteraction);
+    };
+    document.addEventListener('mousemove', initAudioOnInteraction);
+    document.addEventListener('keydown', initAudioOnInteraction);
+    document.addEventListener('click', initAudioOnInteraction);
     
     animate();
 }
@@ -1488,10 +2139,16 @@ function updatePlayerMissiles(delta) {
     for (let i = playerMissiles.length - 1; i >= 0; i--) {
         const m = playerMissiles[i];
         if (!m.userData.active) {
+            m.userData.propellingSound?.stop();
+            if (m.userData.trail) scene.remove(m.userData.trail.line);
             scene.remove(m);
             playerMissiles.splice(i, 1);
             continue;
         }
+        
+        for (let k = 0; k < 3; k++) m.userData.trail?.addPoint(m.userData.position, m.userData.velocity);
+        m.userData.trail?.update(delta);
+        m.userData.propellingSound?.updatePosition(m.userData.position);
         
         const target = m.userData.target;
         if (target && target.active) {
@@ -1521,7 +2178,7 @@ function updatePlayerMissiles(delta) {
             if (!cannon.active) continue;
             const dist = m.userData.position.distanceTo(cannon.position);
             if (dist < cannon.radius + 1) {
-                createExplosion(cannon.position.clone());
+                createExplosion(cannon.position.clone(), true, true);
                 triggerScreenBrighten(0.95, 0.6);
                 scene.remove(cannon.mesh);
                 cannon.active = false;
@@ -1568,10 +2225,16 @@ function updateMissiles(delta) {
     for (let i = missiles.length - 1; i >= 0; i--) {
         const m = missiles[i];
         if (!m.userData.active) {
+            m.userData.propellingSound?.stop();
+            if (m.userData.trail) scene.remove(m.userData.trail.line);
             scene.remove(m);
             missiles.splice(i, 1);
             continue;
         }
+        
+        for (let k = 0; k < 3; k++) m.userData.trail?.addPoint(m.userData.position, m.userData.velocity);
+        m.userData.trail?.update(delta);
+        m.userData.propellingSound?.updatePosition(m.userData.position);
         
         const toPlayer = planeState.position.clone().sub(m.userData.position).normalize();
         m.userData.velocity.lerp(toPlayer.multiplyScalar(105), homingStrength * delta);
@@ -1677,6 +2340,16 @@ function animate() {
     const delta = Math.min((now - lastTime) / 1000, 0.1);
     lastTime = now;
     
+    // Engine sound (varies with speed)
+    if (audioCtx) {
+        if (gameOver) {
+            stopEngineSound();
+        } else {
+            playEngineSound(planeState.speed);
+        }
+        updateAudioListener();
+    }
+    
     updatePlane(delta);
     lockedCannon = getLockTarget();  // Automatic lock - no key needed
     updateMinimap();
@@ -1689,10 +2362,14 @@ function animate() {
     updateGroundFire(delta);
     if (water && water.material.uniforms) {
         water.material.uniforms.uTime.value = now * 0.001;
-        const sunDir = new THREE.Vector3(100, 200, 50).normalize();
+        water.material.uniforms.uMoveFactor.value = (now * 0.03 * 0.001) % 1;
+        const sunDir = SUN_POSITION.clone().normalize();
         water.material.uniforms.uSunDirection.value.copy(
             sunDir.transformDirection(camera.matrixWorldInverse)
         );
+                water.material.uniforms.uSunPosition.value.copy(SUN_POSITION);
+                water.material.uniforms.uLightPosition.value.copy(LIGHT_POSITION);
+                water.material.uniforms.uCameraPosition.value.copy(camera.position);
     }
     
     
@@ -1710,18 +2387,27 @@ function animate() {
 
 // ============ RESTART ============
 function restart() {
+    resumeAudio();
     gameOver = false;
     crashed = false;
     hitByMissile = false;
     shotDownFalling = false;
     
-    playerMissiles.forEach(m => scene.remove(m));
+    playerMissiles.forEach(m => {
+        m.userData.propellingSound?.stop();
+        if (m.userData.trail) scene.remove(m.userData.trail.line);
+        scene.remove(m);
+    });
     playerMissiles = [];
     lockedCannon = null;
     
     cannons.forEach(c => { if (c.mesh.parent) c.mesh.parent.remove(c.mesh); });
     cannons = [];
-    missiles.forEach(m => scene.remove(m));
+    missiles.forEach(m => {
+        m.userData.propellingSound?.stop();
+        if (m.userData.trail) scene.remove(m.userData.trail.line);
+        scene.remove(m);
+    });
     missiles = [];
     
     createCannons();
