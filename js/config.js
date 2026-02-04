@@ -4,9 +4,8 @@ import * as THREE from 'three';
 export const TERRAIN_SIZE = 4000;
 export const TERRAIN_SEGMENTS = 128;
 
-// Lighting
-export const SUN_POSITION = new THREE.Vector3(400, 800, 200);
-export const LIGHT_POSITION = new THREE.Vector3(-800, 120, -600);
+// Lighting - overhead ambient for terrain (no sun)
+export const TERRAIN_LIGHT_POSITION = new THREE.Vector3(0, 5000, 0);
 
 // Missiles
 export const MISSILE_RELOAD_TIME = 3;

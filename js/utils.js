@@ -1,5 +1,19 @@
 import * as THREE from 'three';
 
+/** Load vertex and fragment shaders from js/shaders/{name}.vert and .frag */
+export async function loadShaders() {
+    const names = ['skybox', 'terrain', 'water'];
+    const results = {};
+    await Promise.all(names.map(async (name) => {
+        const [vert, frag] = await Promise.all([
+            fetch(`js/shaders/${name}.vert`).then(r => r.text()),
+            fetch(`js/shaders/${name}.frag`).then(r => r.text()),
+        ]);
+        results[name] = { vertexShader: vert, fragmentShader: frag };
+    }));
+    return results;
+}
+
 export function noise2D(x, y) {
     return Math.sin(x * 0.01) * Math.cos(y * 0.01) * 10 +
            Math.sin(x * 0.02 + 1) * Math.cos(y * 0.02) * 5 +

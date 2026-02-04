@@ -1,8 +1,8 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-import { TERRAIN_SIZE, TERRAIN_SEGMENTS, SUN_POSITION, LIGHT_POSITION, MISSILE_RELOAD_TIME, PLANE_MODEL_URL } from './js/config.js';
-import { noise2D, createTerrainTexture, createSmokeTexture, createCloudTexture } from './js/utils.js';
+import { TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_LIGHT_POSITION, MISSILE_RELOAD_TIME, PLANE_MODEL_URL } from './js/config.js';
+import { loadShaders, noise2D, createTerrainTexture, createSmokeTexture, createCloudTexture } from './js/utils.js';
 
 // ============ GAME STATE ============
 let scene, camera, renderer;
@@ -410,74 +410,25 @@ function playCrash(pos) {
 
 // ============ CREATE SKYBOX ============
 // Procedural gradient skybox - no external textures needed
-// Large inverted box with gradient shader (zenith to horizon)
-function createSkybox() {
-    const skyboxSize = 50000;  // Surrounds the entire play area
+function createSkybox(shaders) {
+    const skyboxSize = 50000;
     const geometry = new THREE.BoxGeometry(skyboxSize, skyboxSize, skyboxSize);
-    
     const skyboxMaterial = new THREE.ShaderMaterial({
         uniforms: {
-            uSunDirection: { value: new THREE.Vector3(0.2, 0.5, 0.3).normalize() },
-            uZenithColor: { value: new THREE.Color(0x1a3a5c) },   // Deep blue at top
-            uHorizonColor: { value: new THREE.Color(0x87ceeb) },   // Light blue at horizon
-            uGroundColor: { value: new THREE.Color(0xb0c4de) },    // Lighter below horizon
-            uSunGlow: { value: 0.5 },
+            uZenithColor: { value: new THREE.Color(0x1a3a5c) },
+            uHorizonColor: { value: new THREE.Color(0x87ceeb) },
+            uGroundColor: { value: new THREE.Color(0xb0c4de) },
         },
-        vertexShader: `
-            varying vec3 vWorldPosition;
-            varying vec3 vViewDirection;
-            void main() {
-                vec4 worldPos = modelMatrix * vec4(position, 1.0);
-                vWorldPosition = worldPos.xyz;
-                vViewDirection = (modelViewMatrix * vec4(position, 1.0)).xyz;
-                gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-            }
-        `,
-        fragmentShader: `
-            uniform vec3 uSunDirection;
-            uniform vec3 uZenithColor;
-            uniform vec3 uHorizonColor;
-            uniform vec3 uGroundColor;
-            uniform float uSunGlow;
-            varying vec3 vWorldPosition;
-            varying vec3 vViewDirection;
-            void main() {
-                vec3 dir = normalize(vWorldPosition);
-                float h = dir.y;  // -1 at bottom, 1 at top
-                float t = smoothstep(-0.1, 0.5, h);
-                vec3 skyColor = mix(uHorizonColor, uZenithColor, t);
-                float groundMask = smoothstep(0.0, -0.05, h);
-                skyColor = mix(skyColor, uGroundColor, groundMask);
-                float sunDot = max(0.0, dot(normalize(vViewDirection), uSunDirection));
-                float sunGlow = pow(sunDot, 8.0) * uSunGlow;
-                skyColor += vec3(1.0, 0.95, 0.85) * sunGlow;
-                gl_FragColor = vec4(skyColor, 1.0);
-            }
-        `,
+        vertexShader: shaders.vertexShader,
+        fragmentShader: shaders.fragmentShader,
         side: THREE.BackSide,
         depthWrite: false,
         depthTest: true,
     });
-    
     const skybox = new THREE.Mesh(geometry, skyboxMaterial);
     skybox.frustumCulled = false;
-    skybox.renderOrder = -1000;  // Render first (behind everything)
+    skybox.renderOrder = -1000;
     scene.add(skybox);
-}
-
-// ============ CREATE SKY ============
-function createSky(sunLight) {
-    const sky = new Sky();
-    sky.scale.setScalar(450000);
-    scene.add(sky);
-    
-    const sunPosition = new THREE.Vector3();
-    sunPosition.copy(sunLight.position);
-    sky.material.uniforms.sunPosition.value.copy(sunPosition);
-    sky.material.uniforms.turbidity.value = 6;
-    sky.material.uniforms.rayleigh.value = 0.8;
-    sky.material.uniforms.mieCoefficient.value = 0.012;
-    sky.material.uniforms.mieDirectionalG.value = 0.76;
 }
 
 // ============ CREATE CLOUDS (simple plane-based) ============
@@ -513,7 +464,7 @@ function createClouds() {
 }
 
 // ============ CREATE TERRAIN (uni GP blend-map) ============
-function createTerrain() {
+function createTerrain(shaders) {
     const geometry = new THREE.PlaneGeometry(TERRAIN_SIZE, TERRAIN_SIZE, TERRAIN_SEGMENTS, TERRAIN_SEGMENTS);
     geometry.rotateX(-Math.PI / 2);
     
@@ -552,60 +503,14 @@ function createTerrain() {
                                 gTexture: { value: g },
                                 bTexture: { value: b },
                                 blendMap: { value: blend },
-                                sunDir: { value: SUN_POSITION.clone().normalize() },
-                                sunColor: { value: new THREE.Color(0xfff5e6) },
+                                lightPosition: { value: TERRAIN_LIGHT_POSITION.clone() },
+                                lightColor: { value: new THREE.Color(0xe8f0f8) },
                                 skyColour: { value: (scene.fog && scene.fog.color) ? scene.fog.color.clone() : new THREE.Color(0x87ceeb) },
                                 density: { value: 0.0009 },
                                 gradient: { value: 1.0 },
                             },
-                            vertexShader: `
-                                varying vec2 vUv;
-                                varying vec3 vNormal;
-                                varying vec3 vSunDir;
-                                varying float vVisibility;
-                                uniform vec3 sunDir;
-                                uniform float density;
-                                uniform float gradient;
-                                void main() {
-                                    vUv = uv;
-                                    vNormal = normalize(normalMatrix * normal);
-                                    vSunDir = (viewMatrix * vec4(sunDir, 0.0)).xyz;
-                                    vec4 mvPos = modelViewMatrix * vec4(position, 1.0);
-                                    float dist = length(mvPos.xyz);
-                                    vVisibility = clamp(exp(-pow((dist * density), gradient)), 0.0, 1.0);
-                                    gl_Position = projectionMatrix * mvPos;
-                                }
-                            `,
-                            fragmentShader: `
-                                uniform sampler2D backgroundTexture;
-                                uniform sampler2D rTexture;
-                                uniform sampler2D gTexture;
-                                uniform sampler2D bTexture;
-                                uniform sampler2D blendMap;
-                                uniform vec3 sunColor;
-                                uniform vec3 skyColour;
-                                varying vec2 vUv;
-                                varying vec3 vNormal;
-                                varying vec3 vSunDir;
-                                varying float vVisibility;
-                                void main() {
-                                    vec4 blendMapColour = texture2D(blendMap, vUv);
-                                    float backAmount = 1.0 - (blendMapColour.r + blendMapColour.g + blendMapColour.b);
-                                    vec2 tiled = vUv * 40.0;
-                                    vec4 bgCol = texture2D(backgroundTexture, tiled) * backAmount;
-                                    vec4 rCol = texture2D(rTexture, tiled) * blendMapColour.r;
-                                    vec4 gCol = texture2D(gTexture, tiled) * blendMapColour.g;
-                                    vec4 bCol = texture2D(bTexture, tiled) * blendMapColour.b;
-                                    vec4 totalColour = bgCol + rCol + gCol + bCol;
-                                    vec3 N = normalize(vNormal);
-                                    vec3 L = normalize(vSunDir);
-                                    float NdotL = max(dot(N, L), 0.3);
-                                    vec3 diffuse = NdotL * sunColor.rgb;
-                                    diffuse = max(diffuse, vec3(0.2));
-                                    vec4 lit = vec4(diffuse, 1.0) * totalColour;
-                                    gl_FragColor = mix(vec4(skyColour, 1.0), lit, vVisibility);
-                                }
-                            `,
+                            vertexShader: shaders.terrain.vertexShader,
+                            fragmentShader: shaders.terrain.fragmentShader,
                             lights: false,
                             depthWrite: true,
                             depthTest: true,
@@ -638,20 +543,17 @@ function createTerrain() {
     scene.add(terrain);
     
     terrainGeometry = geometry;
-    createWater();
+    createWater(shaders.water);
     createTrees();
     createCannons();
     return terrain;
 }
 
-// ============ CREATE WATER (matches uni GP WaterRenderer - DuDv ripple, normal map) ============
-// Uses waterDUDV.png + normal.png from uni GP, or procedural fallback
-function createWater() {
+// ============ CREATE WATER (DuDv ripple, normal map) ============
+function createWater(waterShaders) {
     const waterSize = 12000;
     const waterGeometry = new THREE.PlaneGeometry(waterSize, waterSize, 96, 96);
     waterGeometry.rotateX(-Math.PI / 2);
-    
-    const sunDir = SUN_POSITION.clone().normalize();
     
     const dudvPlaceholder = new THREE.DataTexture(new Uint8Array([128, 128, 255, 255]), 1, 1);
     dudvPlaceholder.needsUpdate = true;
@@ -670,11 +572,6 @@ function createWater() {
             uDeepColor: { value: new THREE.Color(0x2d6b7a) },
             uSkyColor: { value: new THREE.Color(0xb8d4e3) },
             uHorizonColor: { value: new THREE.Color(0xd4e8f0) },
-            uSunDirection: { value: sunDir },
-            uSunPosition: { value: SUN_POSITION.clone() },
-            uSunColor: { value: new THREE.Color(0xfff8e8) },
-            uLightPosition: { value: LIGHT_POSITION.clone() },
-            uLightColor: { value: new THREE.Color(0xffeedd) },
             uCameraPosition: { value: new THREE.Vector3(0, 0, 0) },
             uWaterSize: { value: waterSize },
             uMoveFactor: { value: 0 },
@@ -682,206 +579,8 @@ function createWater() {
             fogNear: { value: scene.fog ? scene.fog.near : 400 },
             fogFar: { value: scene.fog ? scene.fog.far : 1400 },
         },
-        vertexShader: `
-            uniform float uTime;
-            uniform float uWaterSize;
-            varying vec2 textureCoords;
-            varying vec3 vViewPosition;
-            varying vec3 vWorldPosition;
-            varying vec3 vNormal;
-            varying float vFogDepth;
-            
-            #define PI 3.14159265359
-            
-            vec3 gerstnerWave(vec2 uv, vec2 dir, float steepness, float wavelength, float t, inout vec3 tangent, inout vec3 binormal) {
-                float k = 2.0 * PI / wavelength;
-                float c = sqrt(9.8 / k);
-                vec2 d = normalize(dir);
-                float f = k * (dot(d, uv) - c * t);
-                float a = steepness / k;
-                tangent += vec3(-d.x * d.x * (steepness * sin(f)), d.x * (steepness * cos(f)), -d.x * d.y * (steepness * sin(f)));
-                binormal += vec3(-d.x * d.y * (steepness * sin(f)), d.y * (steepness * cos(f)), -d.y * d.y * (steepness * sin(f)));
-                return vec3(d.x * (a * cos(f)), a * sin(f), d.y * (a * cos(f)));
-            }
-            
-            const float tiling = 64.0;
-            void main() {
-                vec2 pos = vec2(position.x, position.z);
-                vec2 baseCoords = vec2(position.x / uWaterSize + 0.5, position.z / uWaterSize + 0.5);
-                textureCoords = baseCoords * tiling;
-                
-                vec3 tangent = vec3(1.0, 0.0, 0.0);
-                vec3 binormal = vec3(0.0, 0.0, 1.0);
-                vec3 disp = vec3(0.0);
-                disp += gerstnerWave(pos, vec2(1.0, 0.3), 0.01, 16.0, uTime * 0.6, tangent, binormal);
-                disp += gerstnerWave(pos, vec2(-0.7, 0.6), 0.008, 12.0, uTime * 0.5, tangent, binormal);
-                disp += gerstnerWave(pos, vec2(0.4, -0.9), 0.006, 10.0, uTime * 0.4, tangent, binormal);
-                disp += gerstnerWave(pos, vec2(-0.2, -0.5), 0.005, 8.0, uTime * 0.35, tangent, binormal);
-                vec3 newPos = vec3(position.x, 0.0, position.z) + disp * 0.5;
-                vec4 worldPos = modelMatrix * vec4(newPos, 1.0);
-                vWorldPosition = worldPos.xyz;
-                vNormal = normalize(cross(binormal, tangent));
-                vec4 mvPosition = modelViewMatrix * vec4(newPos, 1.0);
-                vViewPosition = -mvPosition.xyz;
-                vFogDepth = -mvPosition.z;
-                gl_Position = projectionMatrix * mvPosition;
-            }
-        `,
-        fragmentShader: `
-            uniform float uTime;
-            uniform vec3 uWaterColor;
-            uniform vec3 uDeepColor;
-            uniform vec3 uSkyColor;
-            uniform vec3 uHorizonColor;
-            uniform vec3 uSunDirection;
-            uniform vec3 uSunPosition;
-            uniform vec3 uSunColor;
-            uniform vec3 uLightPosition;
-            uniform vec3 uLightColor;
-            uniform vec3 uCameraPosition;
-            uniform float uWaterSize;
-            uniform float uMoveFactor;
-            uniform sampler2D uDudvMap;
-            uniform sampler2D uNormalMap;
-            uniform vec3 fogColor;
-            uniform float fogNear;
-            uniform float fogFar;
-            varying vec2 textureCoords;
-            varying vec3 vViewPosition;
-            varying vec3 vWorldPosition;
-            varying vec3 vNormal;
-            varying float vFogDepth;
-            
-            float hash(vec2 p) {
-                return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
-            }
-            float hash(vec2 p, float t) {
-                return fract(sin(dot(p + t, vec2(127.1, 311.7))) * 43758.5453);
-            }
-            float simplexNoise(vec2 p) {
-                vec2 i = floor(p);
-                vec2 f = fract(p);
-                float a = hash(i);
-                float b = hash(i + vec2(1.0, 0.0));
-                float c = hash(i + vec2(0.0, 1.0));
-                float d = hash(i + vec2(1.0, 1.0));
-                vec2 u = f * f * (3.0 - 2.0 * f);
-                return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-            }
-            float fbm(vec2 p) {
-                float v = 0.0, a = 0.5, f = 1.0;
-                for (int i = 0; i < 4; i++) {
-                    v += a * simplexNoise(p * f + uTime * 0.25);
-                    a *= 0.5;
-                    f *= 2.0;
-                }
-                return v;
-            }
-            vec3 getRippleNormal(vec2 pos) {
-                float eps = 1.5;
-                float h = fbm(pos * 0.28);
-                float hx = fbm(pos * 0.28 + vec2(eps, 0.0));
-                float hz = fbm(pos * 0.28 + vec2(0.0, eps));
-                vec3 smallRipple = normalize(vec3(h - hx, 1.0, h - hz));
-                return normalize(vNormal + smallRipple * 0.35);
-            }
-            
-            vec2 sampleDudv(vec2 uv) {
-                return texture2D(uDudvMap, uv).rg;
-            }
-            
-            vec3 baseWaterColor() {
-                return vec3(0.0, 0.0, 1.0);
-            }
-            
-            // Procedural environment: sample sky/horizon based on reflection direction (world-space R)
-            vec3 sampleEnvironment(vec3 R) {
-                float y = R.y;
-                vec3 zenithColor = uSkyColor;
-                vec3 horizonColor = uHorizonColor;
-                vec3 groundColor = uDeepColor;
-                float t = smoothstep(-0.15, 0.0, y);
-                vec3 lower = mix(groundColor, horizonColor, t);
-                t = smoothstep(0.0, 0.4, y);
-                vec3 mid = mix(horizonColor, zenithColor, t);
-                t = smoothstep(0.4, 1.0, y);
-                vec3 env = mix(mid, zenithColor, t);
-                vec3 toSun = normalize(uSunPosition);
-                float sunDot = max(dot(R, toSun), 0.0);
-                float sunDisc = pow(sunDot, 64.0);
-                env += uSunColor * sunDisc * 2.0;
-                float lightDot = max(dot(R, normalize(uLightPosition - vWorldPosition)), 0.0);
-                env += uLightColor * pow(lightDot, 32.0) * 0.8;
-                return env;
-            }
-            
-            const float tiling = 64.0;
-            void main() {
-                const float waveStrength = 0.012;
-                const float shineDamper = 20.0;
-                const float reflectivity = 0.5;
-                
-                vec2 dudvSample1 = sampleDudv(vec2(textureCoords.x + uMoveFactor, textureCoords.y)) * 0.1;
-                vec2 distortedTexCoords = textureCoords + vec2(dudvSample1.x, dudvSample1.y + uMoveFactor);
-                vec2 totalDistortion = (sampleDudv(distortedTexCoords) * 2.0 - 1.0) * waveStrength;
-                
-                vec4 normalMapColour = texture2D(uNormalMap, distortedTexCoords);
-                vec3 normalFromMap = normalize(vec3(normalMapColour.r * 2.0 - 1.0, normalMapColour.b * 3.0, normalMapColour.g * 2.0 - 1.0));
-                
-                vec3 viewDirWorld = normalize(uCameraPosition - vWorldPosition);
-                vec3 viewDir = normalize(vViewPosition);
-                vec2 uv = (textureCoords / tiling) * uWaterSize * 0.001;
-                vec3 N = normalize(vNormal + normalFromMap * 0.6);
-                
-                float NdotV = max(dot(N, viewDir), 0.0);
-                float F0 = 0.02;
-                float fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
-                
-                vec3 R = reflect(-viewDirWorld, N);
-                R.xz += totalDistortion * 0.8;
-                R = normalize(R);
-                vec3 envReflection = sampleEnvironment(R);
-                
-                // Roughness: sample with perturbed normals for distorted, broken-up reflection
-                vec3 N1 = getRippleNormal(uv + vec2(1.5, 0.0));
-                vec3 N2 = getRippleNormal(uv + vec2(0.0, 1.5));
-                vec3 N3 = getRippleNormal(uv + vec2(1.0, 1.0));
-                vec3 N4 = getRippleNormal(uv + vec2(-1.0, 0.5));
-                vec3 R1 = reflect(-viewDirWorld, N1);
-                vec3 R2 = reflect(-viewDirWorld, N2);
-                vec3 R3 = reflect(-viewDirWorld, N3);
-                vec3 R4 = reflect(-viewDirWorld, N4);
-                envReflection = (envReflection + sampleEnvironment(R1) + sampleEnvironment(R2) + sampleEnvironment(R3) + sampleEnvironment(R4)) / 5.0;
-                
-                vec3 deepColor = mix(baseWaterColor(), uDeepColor, 0.6);
-                vec3 reflectColor = mix(deepColor, envReflection, fresnel * 0.95);
-                
-                vec3 toLight = normalize(uLightPosition - vWorldPosition);
-                vec3 reflectedLight = reflect(-toLight, N);
-                float specular = max(dot(reflectedLight, viewDir), 0.0);
-                specular = pow(specular, shineDamper);
-                vec3 specularHighlights = uLightColor * specular * reflectivity;
-                
-                vec3 halfDir = normalize(viewDir + uSunDirection);
-                float NdotH = max(dot(N, halfDir), 0.0);
-                float sunSpec = pow(NdotH, shineDamper);
-                vec3 sunGlare = uSunColor * sunSpec * reflectivity * 2.0;
-                
-                vec3 R_light = reflect(-viewDir, N);
-                float lightSpec = pow(max(dot(R_light, toLight), 0.0), 32.0);
-                float lightDist = length(uLightPosition - vWorldPosition);
-                float lightAtten = 1.0 / (1.0 + lightDist * 0.0008);
-                vec3 lightReflection = uLightColor * lightSpec * lightAtten * 1.5;
-                
-                vec3 finalColor = reflectColor + sunGlare + specularHighlights + lightReflection;
-                finalColor = mix(finalColor, vec3(0.0, 0.3, 0.5), 0.2);
-                float alpha = mix(0.45, 0.72, fresnel);
-                
-                vec4 baseColor = vec4(finalColor, alpha);
-                float fogFactor = clamp((fogFar - vFogDepth) / (fogFar - fogNear), 0.0, 1.0);
-                gl_FragColor = mix(vec4(fogColor, alpha), baseColor, fogFactor);
-            }
-        `,
+        vertexShader: waterShaders.vertexShader,
+        fragmentShader: waterShaders.fragmentShader,
         transparent: true,
         side: THREE.DoubleSide,
         depthWrite: true,
@@ -1620,9 +1319,11 @@ function checkCollision() {
 }
 
 // ============ INIT ============
-function init() {
+async function init() {
+    const shaders = await loadShaders();
+    
     scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x87ceeb);  // Fallback; Sky dome provides main background
+    scene.background = new THREE.Color(0x87ceeb);
     scene.fog = new THREE.Fog(0x87ceeb, 800, 6000);
     
     camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 15000);
@@ -1636,38 +1337,12 @@ function init() {
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     document.getElementById('game-container').appendChild(renderer.domElement);
     
-    // Lights - softer for natural water reflections
-    const ambient = new THREE.AmbientLight(0xe8f0f8, 0.7);
+    const ambient = new THREE.AmbientLight(0xe8f0f8, 0.85);
     scene.add(ambient);
     
-    const sun = new THREE.DirectionalLight(0xfff5e6, 0.95);
-    sun.position.copy(SUN_POSITION);
-    sun.castShadow = true;
-    sun.shadow.mapSize.width = 2048;
-    sun.shadow.mapSize.height = 2048;
-    sun.shadow.camera.near = 0.5;
-    sun.shadow.camera.far = 500;
-    sun.shadow.camera.left = -200;
-    sun.shadow.camera.right = 200;
-    sun.shadow.camera.top = 200;
-    sun.shadow.camera.bottom = -200;
-    scene.add(sun);
-    
-    
-    // Secondary point light - creates distinct reflection on water
-    const pointLight = new THREE.PointLight(0xffeedd, 0.8, 1200);
-    pointLight.position.copy(LIGHT_POSITION);
-    scene.add(pointLight);
-    const lightMesh = new THREE.Mesh(
-        new THREE.SphereGeometry(8, 8, 8),
-        new THREE.MeshBasicMaterial({ color: 0xffeedd })
-    );
-    lightMesh.position.copy(LIGHT_POSITION);
-    scene.add(lightMesh);
-    
-    createSkybox();  // Gradient skybox (replaces Sky for cleaner look)
+    createSkybox(shaders.skybox);
     createClouds();
-    createTerrain();
+    createTerrain(shaders);
     createPlane();
     planeState.rotation.order = 'YZX';  // Yaw, Roll, Pitch - pitch around plane's local X axis
     
@@ -2364,13 +2039,7 @@ function animate() {
     if (water && water.material.uniforms) {
         water.material.uniforms.uTime.value = now * 0.001;
         water.material.uniforms.uMoveFactor.value = (now * 0.03 * 0.001) % 1;
-        const sunDir = SUN_POSITION.clone().normalize();
-        water.material.uniforms.uSunDirection.value.copy(
-            sunDir.transformDirection(camera.matrixWorldInverse)
-        );
-                water.material.uniforms.uSunPosition.value.copy(SUN_POSITION);
-                water.material.uniforms.uLightPosition.value.copy(LIGHT_POSITION);
-                water.material.uniforms.uCameraPosition.value.copy(camera.position);
+        water.material.uniforms.uCameraPosition.value.copy(camera.position);
     }
     
     

@@ -3,8 +3,6 @@ uniform vec3 uWaterColor;
 uniform vec3 uDeepColor;
 uniform vec3 uSkyColor;
 uniform vec3 uHorizonColor;
-uniform vec3 uLightPosition;
-uniform vec3 uLightColor;
 uniform vec3 uCameraPosition;
 uniform float uWaterSize;
 uniform float uMoveFactor;
@@ -72,8 +70,6 @@ vec3 sampleEnvironment(vec3 R) {
     vec3 mid = mix(horizonColor, zenithColor, t);
     t = smoothstep(0.4, 1.0, y);
     vec3 env = mix(mid, zenithColor, t);
-    float lightDot = max(dot(R, normalize(uLightPosition - vWorldPosition)), 0.0);
-    env += uLightColor * pow(lightDot, 32.0) * 0.8;
     return env;
 }
 
@@ -81,8 +77,6 @@ const float tiling = 64.0;
 
 void main() {
     const float waveStrength = 0.012;
-    const float shineDamper = 20.0;
-    const float reflectivity = 0.5;
     
     vec2 dudvSample1 = sampleDudv(vec2(textureCoords.x + uMoveFactor, textureCoords.y)) * 0.1;
     vec2 distortedTexCoords = textureCoords + vec2(dudvSample1.x, dudvSample1.y + uMoveFactor);
@@ -118,19 +112,7 @@ void main() {
     vec3 deepColor = mix(baseWaterColor(), uDeepColor, 0.6);
     vec3 reflectColor = mix(deepColor, envReflection, fresnel * 0.95);
     
-    vec3 toLight = normalize(uLightPosition - vWorldPosition);
-    vec3 reflectedLight = reflect(-toLight, N);
-    float specular = max(dot(reflectedLight, viewDir), 0.0);
-    specular = pow(specular, shineDamper);
-    vec3 specularHighlights = uLightColor * specular * reflectivity;
-    
-    vec3 R_light = reflect(-viewDir, N);
-    float lightSpec = pow(max(dot(R_light, toLight), 0.0), 32.0);
-    float lightDist = length(uLightPosition - vWorldPosition);
-    float lightAtten = 1.0 / (1.0 + lightDist * 0.0008);
-    vec3 lightReflection = uLightColor * lightSpec * lightAtten * 1.5;
-    
-    vec3 finalColor = reflectColor + specularHighlights + lightReflection;
+    vec3 finalColor = reflectColor;
     finalColor = mix(finalColor, vec3(0.0, 0.3, 0.5), 0.2);
     float alpha = mix(0.45, 0.72, fresnel);
     
